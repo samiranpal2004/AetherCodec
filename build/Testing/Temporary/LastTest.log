@@ -1,0 +1,229 @@
+Start testing: Jul 26 01:08 IST
+----------------------------------------------------------
+1/10 Testing: test_packet
+1/10 Test: test_packet
+Command: "/home/sudipta/D_drive/aethercodec/build/tests/test_packet"
+Directory: /home/sudipta/D_drive/aethercodec/build/tests
+"test_packet" start time: Jul 26 01:08 IST
+Output:
+----------------------------------------------------------
+✓ Packet pack/unpack/CRC + CTRL_STATS_REPLY: PASS
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_packet" end time: Jul 26 01:08 IST
+"test_packet" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/10 Testing: test_lpc
+2/10 Test: test_lpc
+Command: "/home/sudipta/D_drive/aethercodec/build/tests/test_lpc"
+Directory: /home/sudipta/D_drive/aethercodec/build/tests
+"test_lpc" start time: Jul 26 01:08 IST
+Output:
+----------------------------------------------------------
+✓ LPC round-trip (sine): LOSSLESS (0 mismatches), order=8 k=12
+  Raw: 6144 bytes | Compressed: 4458 bytes | Ratio: 1.38x
+✓ LPC round-trip (noise): LOSSLESS (0 mismatches), order=32 k=20
+  Raw: 6144 bytes | Compressed: 6172 bytes | Ratio: 1.00x
+✓ LPC round-trip (silence): LOSSLESS (0 mismatches), order=8 k=0
+  Raw: 6144 bytes | Compressed: 255 bytes | Ratio: 24.09x
+
+All LPC round-trip tests passed — bit-perfect reconstruction.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_lpc" end time: Jul 26 01:08 IST
+"test_lpc" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/10 Testing: test_codec_nl
+3/10 Test: test_codec_nl
+Command: "/home/sudipta/D_drive/aethercodec/build/tests/test_codec_nl"
+Directory: /home/sudipta/D_drive/aethercodec/build/tests
+"test_codec_nl" start time: Jul 26 01:08 IST
+Output:
+----------------------------------------------------------
+✓ NL mixed      LOSSLESS (0 mismatches)  payload  8718 bytes  ratio 1.41x
+✓ NL correlated LOSSLESS (0 mismatches)  payload  7131 bytes  ratio 1.72x
+✓ NL decorr-ref LOSSLESS (0 mismatches)  payload  8071 bytes  ratio 1.52x
+✓ NL panned     LOSSLESS (0 mismatches)  payload  3877 bytes  ratio 3.17x
+✓ NL 16-in-24   LOSSLESS (0 mismatches)  payload  5216 bytes  ratio 2.36x
+✓ NL 24bit-ref  LOSSLESS (0 mismatches)  payload  9042 bytes  ratio 1.36x
+
+All NL integration cases bit-perfect (mid/side gain 1.72x vs 1.52x, wasted-bits gain 2.36x vs 1.36x).
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_codec_nl" end time: Jul 26 01:08 IST
+"test_codec_nl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/10 Testing: test_mdct
+4/10 Test: test_mdct
+Command: "/home/sudipta/D_drive/aethercodec/build/tests/test_mdct"
+Directory: /home/sudipta/D_drive/aethercodec/build/tests
+"test_mdct" start time: Jul 26 01:08 IST
+Output:
+----------------------------------------------------------
+Princen-Bradley max deviation: 6.071e-08
+Bark table: 64 bands span 512 bins, non-decreasing: OK
+MDCT/IMDCT overlap-add max reconstruction error: 4.172e-07
+
+✓ MDCT: window valid, transform reconstructs to 4.2e-07 (< 1e-5)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_mdct" end time: Jul 26 01:08 IST
+"test_mdct" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/10 Testing: test_codec_hq
+5/10 Test: test_codec_hq
+Command: "/home/sudipta/D_drive/aethercodec/build/tests/test_codec_hq"
+Directory: /home/sudipta/D_drive/aethercodec/build/tests
+"test_codec_hq" start time: Jul 26 01:08 IST
+Output:
+----------------------------------------------------------
+✓ HQ codec: 64 frames, 2 ch @ 96000 Hz, hop 512
+  tonal      SNR full  27.5 dB | SNR audible  27.5 dB | peak err   472502 |    178 kbps (25.9x)
+  broadband  SNR full  13.3 dB | SNR audible  27.6 dB | peak err  2132991 |    598 kbps (7.7x)
+  broadband x4 SNR full  13.3 dB | SNR audible  27.6 dB | peak err  2132991 |    569 kbps (8.1x)
+
+  SMR 30.0 dB ->  598.4 kbps  (audible SNR 27.6 dB)
+  SMR 24.0 dB ->  528.9 kbps  (audible SNR 21.7 dB)
+  SMR 18.0 dB ->  375.0 kbps  (audible SNR 16.5 dB)
+  SMR 12.0 dB ->  294.7 kbps  (audible SNR 12.0 dB)
+  SMR  6.0 dB ->  202.1 kbps  (audible SNR 1.5 dB)
+✓ HQ rate control: 598 -> 202 kbps across SMR 30..6 dB (3.0x span)
+
+HQ round-trip OK (lossy by design; bitrate adapts to content).
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"test_codec_hq" end time: Jul 26 01:08 IST
+"test_codec_hq" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/10 Testing: test_ring
+6/10 Test: test_ring
+Command: "/home/sudipta/D_drive/aethercodec/build/tests/test_ring"
+Directory: /home/sudipta/D_drive/aethercodec/build/tests
+"test_ring" start time: Jul 26 01:08 IST
+Output:
+----------------------------------------------------------
+✓ ring: capacity, wraparound, short read/write OK
+✓ ring: 500000 values through threaded SPSC, in order, no loss
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_ring" end time: Jul 26 01:08 IST
+"test_ring" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/10 Testing: test_jitter
+7/10 Test: test_jitter
+Command: "/home/sudipta/D_drive/aethercodec/build/tests/test_jitter"
+Directory: /home/sudipta/D_drive/aethercodec/build/tests
+"test_jitter" start time: Jul 26 01:08 IST
+Output:
+----------------------------------------------------------
+✓ jitter: prefill + in-order playout OK
+✓ jitter: out-of-order 5,7,6 played as 5,6,7
+✓ jitter: duplicate sequence rejected
+✓ jitter: missing packet reported as loss, stream resumes
+✓ jitter: stale packet discarded
+✓ jitter: re-anchors after a sequence restart
+✓ jitter: re-anchors after a long outage
+✓ jitter: level_ms follows the stream's frame size
+
+All jitter buffer tests passed.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_jitter" end time: Jul 26 01:08 IST
+"test_jitter" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/10 Testing: test_abr
+8/10 Test: test_abr
+Command: "/home/sudipta/D_drive/aethercodec/build/tests/test_abr"
+Directory: /home/sudipta/D_drive/aethercodec/build/tests
+"test_abr" start time: Jul 26 01:08 IST
+Output:
+----------------------------------------------------------
+✓ abr: link classification matches the spec ladder
+✓ abr: state -> (mode, rate) mapping correct
+✓ abr: downgrade after 2 polls (1000 ms) -> HQ-48kHz
+✓ abr: upgrade held off until 3000 ms elapsed, then -> NL-96kHz
+✓ abr: alternating good/bad link causes no switching
+✓ abr: stable link produces no mode changes
+✓ abr: walking away steps NL-96k -> NL-48k -> HQ-96k -> HQ-48k
+✓ abr: congestion steps down despite strong RSSI
+✓ abr: does not oscillate back into the congested mode
+✓ abr: probes back up after the backoff interval
+✓ abr: no headroom -> ceiling holds, no periodic re-probe
+✓ abr: headroom restored -> climbs back to best quality
+✓ abr: start-at holds the start rung against strong RSSI, still downgrades on congestion
+✓ abr: start-at + proven headroom climbs one rung per probe interval
+✓ abr: idle-queue SMR recovery 12 -> 54 dB in 35 ticks (8.8 s at 250 ms)
+✓ abr: rate control settles at SMR 41.5 dB (~937 kbps) on a 900 kbps link
+✓ abr: rate control settles at SMR 26.4 dB (~560 kbps) on a 520 kbps link
+✓ abr: rate control settles at SMR 15.9 dB (~297 kbps) on a 300 kbps link
+
+All ABR tests passed.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_abr" end time: Jul 26 01:08 IST
+"test_abr" time elapsed: 00:00:00
+----------------------------------------------------------
+
+9/10 Testing: test_abr_switch
+9/10 Test: test_abr_switch
+Command: "/home/sudipta/D_drive/aethercodec/build/tests/test_abr_switch"
+Directory: /home/sudipta/D_drive/aethercodec/build/tests
+"test_abr_switch" start time: Jul 26 01:08 IST
+Output:
+----------------------------------------------------------
+✓ abr-switch: sequence continuous across 25 frames and 5 operating points
+✓ abr-switch: HQ SNR after 96k->48k switch = 25.9 dB
+
+All ABR mid-stream switch tests passed.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_abr_switch" end time: Jul 26 01:08 IST
+"test_abr_switch" time elapsed: 00:00:00
+----------------------------------------------------------
+
+10/10 Testing: test_resample
+10/10 Test: test_resample
+Command: "/home/sudipta/D_drive/aethercodec/build/tests/test_resample"
+Directory: /home/sudipta/D_drive/aethercodec/build/tests
+"test_resample" start time: Jul 26 01:08 IST
+Output:
+----------------------------------------------------------
+✓ resample: 8192 -> 4096 -> 8192 frames
+  1 kHz round-trip amplitude ratio: 1.002
+  35 kHz attenuation through decimator: -65.8 dB
+
+All resampler tests passed.
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_resample" end time: Jul 26 01:08 IST
+"test_resample" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Jul 26 01:08 IST

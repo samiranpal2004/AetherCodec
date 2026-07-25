@@ -1,0 +1,11 @@
+test_packet 2 0.00156817
+test_lpc 2 0.00237788
+test_codec_nl 2 0.00419536
+test_mdct 2 0.00163294
+test_codec_hq 2 0.0362673
+test_ring 2 0.00176509
+test_jitter 2 0.00132646
+test_abr 2 0.000566143
+test_abr_switch 2 0.00613022
+test_resample 2 0.00126646
+---

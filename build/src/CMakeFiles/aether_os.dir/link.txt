@@ -1,0 +1,2 @@
+/usr/bin/ar qc libaether_os.a CMakeFiles/aether_os.dir/os/pw_sink.c.o CMakeFiles/aether_os.dir/os/pw_playback.c.o
+/usr/bin/ranlib libaether_os.a
