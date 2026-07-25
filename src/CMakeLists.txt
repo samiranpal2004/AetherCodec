@@ -16,3 +16,14 @@ add_library(aether_transport STATIC
 target_include_directories(aether_transport PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # libbluetooth (from libbluetooth-dev) provides ba2str/str2ba and the RFCOMM API.
 target_link_libraries(aether_transport PUBLIC ${BLUEZ_LIBRARIES} bluetooth)
+
+# --- Phase 2: Near-Lossless codec (LPC + Rice) ---
+add_library(aether_codec STATIC
+    encoder/codec_lpc_enc.c
+    decoder/codec_lpc_dec.c
+    encoder/aether_encoder.c
+    decoder/aether_decoder.c
+)
+target_include_directories(aether_codec PUBLIC ${CMAKE_SOURCE_DIR}/include)
+# aether_transport supplies aether_timestamp_us/packet helpers; m for log2/fabs.
+target_link_libraries(aether_codec PUBLIC aether_transport m)

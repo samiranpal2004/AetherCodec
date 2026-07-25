@@ -199,11 +199,21 @@ cmake ..
 
 ### ✅ Phase 0 Checkpoint
 
-- [x] Packages installed (Laptop A / this machine) — bluez 5.64, libpipewire-0.3 0.3.48, gcc 11, cmake 3.22.1
-- [x] `hciconfig hci0` shows a BD Address (5C:F3:70:6A:0F:CB) — this machine
+- [x] Packages installed (Laptop A / this machine) — Ubuntu 26.04 LTS, bluez 5.85,
+      libpipewire-0.3 1.6.2, fftw3f 3.3.10, gcc 15.2.0, cmake 4.2.3
+- [x] `hciconfig hci0` shows a BD Address (C0:35:32:24:8E:D0) — this machine
+- [x] `hci0` is UP — `UP RUNNING PSCAN`, rfkill unblocked (adapter: Realtek,
+      HCI 5.2, name `sudipta-LOQ-15IRX9`)
 - [ ] Laptops are paired and trusted with each other — pending second laptop
 - [x] `cmake ..` runs without errors
 - [x] Project directory structure exists
+- [x] Full build succeeds (`aether_transport`, `aether_codec`, all tools) and
+      `ctest`: 3/3 tests passed (`test_packet`, `test_lpc`, `test_codec_nl`)
+
+> **Note:** an earlier revision of this checkpoint recorded a different BD
+> address (`5C:F3:70:6A:0F:CB`) and older package versions — that was a
+> different environment, not this machine. Replaced above with this machine's
+> actual verified values now that it's designated **Laptop A**.
 
 ---
 
@@ -797,9 +807,11 @@ You should hear audio on Laptop B's headphones. It may drop packets at high bitr
 ### ✅ Phase 1 Checkpoint
 
 - [x] `test_packet` passes (pack/unpack/CRC verified) — `ctest`: 100% tests passed, 0 failed
-- [ ] `rfcomm_ping` works: Laptop A sends, Laptop B receives 10 pings — builds clean, needs second paired laptop
-- [ ] `rfcomm_bench` shows ≥ 600 kbps throughput (record exact number) — needs second paired laptop
-- [ ] `raw_stream` plays audible audio on Laptop B (may drop at 96kHz, ok) — needs second paired laptop
+- [x] `rfcomm_ping` works: Laptop A (`C0:35:32:24:8E:D0`) sent, Laptop B
+      (`FC:B0:DE:80:0C:B4`, `samiran-Inspiron-15-3525`) received all 10 pings —
+      verified over paired/bonded RFCOMM channel 1
+- [ ] `rfcomm_bench` shows ≥ 600 kbps throughput (record exact number) — pending, now that laptops are paired
+- [ ] `raw_stream` plays audible audio on Laptop B (may drop at 96kHz, ok) — pending, now that laptops are paired
 - [ ] Measured throughput recorded: _________ kbps
 
 > **Note:** `AETHER_HEADER_SIZE` was corrected from **24** to **20** bytes. The
@@ -1323,11 +1335,19 @@ Create simple encode/decode tools in `tools/` that call the encoder and write ra
 
 ### ✅ Phase 2 Checkpoint
 
-- [ ] `test_lpc` passes: 0 mismatches on both sine wave and noise
-- [ ] Compression ratio ≥ 2x on music content (record: ____x)
-- [ ] File-to-file round-trip: decoded WAV is bit-perfect match to original
-- [ ] NL-encoded packets stream over RFCOMM and decode on Laptop B
-- [ ] Compressed audio plays correctly on Laptop B headphones
+- [x] `test_lpc` passes: 0 mismatches on sine wave, noise, **and** silence (bit-perfect)
+- [x] `test_codec_nl` passes: full encoder→pack→CRC→unpack→decoder stereo round-trip is bit-perfect (integration test)
+- [ ] Compression ratio ≥ 2x on music content (record: ____x) — pending real music file; synthetic tone gives ~1.4x, silence 24x, noise 1.0x (incompressible, as expected)
+- [ ] File-to-file round-trip: decoded WAV is bit-perfect match to original — WAV I/O tools not built yet; codec-level round-trip proven by `test_codec_nl`
+- [ ] NL-encoded packets stream over RFCOMM and decode on Laptop B — needs second paired laptop
+- [ ] Compressed audio plays correctly on Laptop B headphones — needs second paired laptop
+
+> **Rice parameter range widened 0–15 → 0–30** (`LPC_RICE_MAX_PARAM` in
+> `codec_lpc.h`). Capping k at 15 makes the unary quotient explode on
+> high-entropy frames (noise), overflowing the output buffer and breaking the
+> lossless guarantee. k is stored as a full byte on the wire, so the wider
+> ceiling is free and keeps worst-case output bounded. Verified by the noise
+> case in `test_lpc` (round-trips losslessly at 1.0x instead of failing).
 
 ---
 
