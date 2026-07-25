@@ -7,6 +7,15 @@
 #define LPC_FRAME_SIZE   2048
 #define LPC_COEFF_SHIFT  15   // Q15 fixed-point for LPC coefficients
 
+/* Max Rice parameter. HLD 5.1 quotes a 0-15 range, but capping at 15 makes the
+   unary quotient explode on high-entropy frames (e.g. noise): a 24-bit residual
+   at k=15 emits hundreds of unary bits per sample, which overflows any sane
+   buffer and breaks the lossless guarantee. k is stored as a full byte on the
+   wire, so widening the ceiling to 30 is free and keeps worst-case output
+   bounded (~k+few bits/sample) while never hurting normal-audio compression
+   (the optimal k there is small anyway). */
+#define LPC_RICE_MAX_PARAM  30
+
 /* LPC encoder state for one frame */
 typedef struct {
     int32_t  coeffs[LPC_MAX_ORDER];  // Q15 fixed-point predictor coefficients
