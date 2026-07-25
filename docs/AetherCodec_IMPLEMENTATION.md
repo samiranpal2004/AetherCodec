@@ -2100,117 +2100,120 @@ static void *abr_thread(void *arg) {
 
 > **Goal:** Produce a clean, measurable, presentable demo with spectral analysis to compare AetherCodec vs LDAC vs raw.
 
----
-
-### Step 6.1 — Spectral Analysis Setup
-
-```bash
-# Install analysis tools
-sudo apt install -y sox audacity python3-numpy python3-matplotlib
-
-# Python spectral comparison script
-cat > tools/compare_spectra.py << 'EOF'
-import sys
-import numpy as np
-import subprocess
-import matplotlib.pyplot as plt
-
-def load_wav_samples(path):
-    raw = subprocess.check_output(['sox', path, '-t', 'raw', '-r', '96000',
-                                   '-b', '32', '-c', '2', '-e', 'signed', '-'])
-    return np.frombuffer(raw, dtype=np.int32).astype(np.float64) / (2**31)
-
-original = load_wav_samples(sys.argv[1])
-decoded  = load_wav_samples(sys.argv[2])
-label    = sys.argv[3] if len(sys.argv) > 3 else "AetherCodec"
-
-diff = original[:len(decoded)] - decoded[:len(original)]
-rms_orig = np.sqrt(np.mean(original**2))
-rms_diff = np.sqrt(np.mean(diff**2))
-snr_db   = 20 * np.log10(rms_orig / (rms_diff + 1e-12))
-
-print(f"Original RMS:    {20*np.log10(rms_orig+1e-12):.1f} dBFS")
-print(f"Difference RMS:  {20*np.log10(rms_diff+1e-12):.1f} dBFS")
-print(f"SNR:             {snr_db:.1f} dB")
-print(f"Lossless:        {'YES' if snr_db > 120 else 'NO'}")
-
-# Plot
-fig, axes = plt.subplots(3, 1, figsize=(12, 9))
-axes[0].specgram(original[::2], Fs=96000, NFFT=4096, noverlap=2048)
-axes[0].set_title("Original"); axes[0].set_ylabel("Freq (Hz)")
-axes[1].specgram(decoded[::2],  Fs=96000, NFFT=4096, noverlap=2048)
-axes[1].set_title(label);       axes[1].set_ylabel("Freq (Hz)")
-axes[2].specgram(diff[::2],     Fs=96000, NFFT=4096, noverlap=2048)
-axes[2].set_title(f"Difference (SNR: {snr_db:.1f} dB)"); axes[2].set_ylabel("Freq (Hz)")
-plt.tight_layout()
-plt.savefig("spectra_comparison.png", dpi=150)
-print("Saved: spectra_comparison.png")
-EOF
-```
+> **Divergence from this section's original sketch.** The plan as written
+> assumed `aether_encode`/`aether_decode` already existed (Step 2.5 used them)
+> and that the live `aether_sender` daemon takes `--input FILE`/
+> `--record-output FILE` flags. Neither was true: `aether_sender` is a
+> PipeWire-driven daemon built around a capture ring buffer (`src/daemon/aether_sender.c`),
+> not a file processor, and MANUAL_TESTING.md §4 explicitly flagged the file
+> tool as "not built yet". Rather than bolt file-I/O onto the live daemon
+> (which would need a second, parallel code path through the ring buffers for
+> no real benefit), Phase 6 adds `tools/aether_encode.c` /
+> `tools/aether_decode.c` as a **separate, direct file-to-file path**: WAV in,
+> `AetherEncoder`/`AetherDecoder` straight through, `.aether` bitstream or WAV
+> out. It links only `aether_codec` (no PipeWire, no Bluetooth), so it's the
+> fastest way to get an SNR/bitrate number and needs neither a second laptop
+> nor a running PipeWire session. The live two-machine path (`aether_sender
+> --target` / `aether_receiver`, already built in Phase 4/5) still covers the
+> `--verbose` bitrate/loss logging Step 6.3 asked for — see §6.3 below.
 
 ---
 
-### Step 6.2 — Demo Script
+### Step 6.1 — File-to-file encode/decode + spectral comparison
+
+Three pieces, all under `tools/`:
+
+- **`aether_encode.c`** — `aether_encode input.wav output.aether [--mode nl|hq]`.
+  Reads a WAV file (`tools/wav_io.c`: 16/24/32-bit integer PCM, mono/stereo),
+  chunks it into `LPC_FRAME_SIZE` (NL) or `MDCT_HOP` (HQ) frames, and feeds
+  each through `aether_encoder_encode` exactly like `aether_sender` does. The
+  output file is `[magic:u32][total_frames:u32]` followed by packed
+  `AetherPacket`s back-to-back — the *same* framing RFCOMM carries, so
+  `aether_decode` reads it with the same header-then-payload loop as
+  `transport_rfcomm.c`'s `rfcomm_recv_packet`. Prints raw/encoded bytes, ratio,
+  and bitrate.
+- **`aether_decode.c`** — `aether_decode input.aether output.wav`. Mode,
+  sample rate, bit depth and channel count all come back out of the first
+  packet's `AetherHeader` — nothing but the original frame count (to trim the
+  last frame's zero-padding) needs to travel outside the packet stream.
+- **`compare_spectra.py`** — `python3 tools/compare_spectra.py original.wav
+  decoded.wav [label] [--shift N] [--no-plot]`. Reports **two** SNRs, not one:
+  full-band and audible-band (same 5-tap-MA-×4 low-pass `test_codec_hq.c`
+  uses, first null ≈ fs/5). The doc's original sketch computed only a naive
+  full-band SNR — per the note in CLAUDE.md, that number is meaningless for HQ
+  mode at 96 kHz, where the psychoacoustic model correctly zeroes everything
+  above the ATH (~17.6 kHz) and full-band SNR just penalizes it for doing so.
+  `--shift 512` compensates for HQ's inherent one-MDCT-hop OLA decode delay
+  (see `codec_mdct_dec.c` / `aether_decoder.c`) before comparing — without it
+  the two signals are misaligned by 512 samples and the SNR is meaningless
+  (verified: an aligned tone came back at **28.4 dB** audible-band, matching
+  `test_codec_hq`'s ~27.5 dB reference; unaligned it read −5 dB). NL needs no
+  shift — LPC has no cross-frame latency, so decode is sample-for-sample
+  aligned with the input. Needs `numpy` (`pip install numpy`); `matplotlib` is
+  optional — its absence just skips the spectrogram PNG, not the SNR numbers.
+
+Verified end-to-end during implementation: a 2 s/96 kHz/24-bit/stereo tone
+round-tripped through NL came back **byte-for-bit-identical** in the raw PCM
+(`sox ... -t raw | cmp` after encode→decode), and separately a mono 16-bit
+48 kHz clip of 2578 samples — not a multiple of any frame size — round-tripped
+identically too, confirming the last-frame zero-pad/truncate logic.
 
 ```bash
-#!/bin/bash
-# demo.sh — run the full AetherCodec demo
-# Run on Laptop B first: ./demo.sh receiver
-# Run on Laptop A:       ./demo.sh sender AA:BB:CC:DD:EE:FF
+cd build
+./tools/aether_encode  test_hires.wav  /tmp/nl.aether  --mode nl
+./tools/aether_decode  /tmp/nl.aether  /tmp/decoded_nl.wav
+python3 ../tools/compare_spectra.py test_hires.wav /tmp/decoded_nl.wav "AetherCodec NL"
 
-TEST_TRACK="test_hires.flac"   # your 24-bit/96kHz test track
-
-if [ "$1" = "receiver" ]; then
-    echo "=== AetherCodec Receiver ==="
-    echo "Starting PipeWire sink + RFCOMM listener..."
-    ./aether_receiver --verbose
-
-elif [ "$1" = "sender" ]; then
-    TARGET_ADDR="$2"
-    echo "=== AetherCodec Sender ==="
-    echo "Connecting to $TARGET_ADDR..."
-
-    echo ""
-    echo "--- Test 1: Near-Lossless 96kHz ---"
-    ./aether_sender --target "$TARGET_ADDR" --mode nl --input "$TEST_TRACK" \
-                    --record-output /tmp/decoded_nl.wav
-    python3 tools/compare_spectra.py "$TEST_TRACK" /tmp/decoded_nl.wav "AetherCodec NL"
-
-    echo ""
-    echo "--- Test 2: Perceptual HQ 96kHz ---"
-    ./aether_sender --target "$TARGET_ADDR" --mode hq --input "$TEST_TRACK" \
-                    --record-output /tmp/decoded_hq.wav
-    python3 tools/compare_spectra.py "$TEST_TRACK" /tmp/decoded_hq.wav "AetherCodec HQ"
-
-    echo ""
-    echo "--- Test 3: Adaptive Bitrate (move laptops during playback) ---"
-    ./aether_sender --target "$TARGET_ADDR" --mode auto --input "$TEST_TRACK"
-fi
+./tools/aether_encode  test_hires.wav  /tmp/hq.aether  --mode hq
+./tools/aether_decode  /tmp/hq.aether  /tmp/decoded_hq.wav
+python3 ../tools/compare_spectra.py test_hires.wav /tmp/decoded_hq.wav "AetherCodec HQ" --shift 512
 ```
+
+`aether_encode` only reads WAV (no FLAC/MP3 parsing — that's what `sox
+input.flac input.wav` is for).
 
 ---
 
-### Step 6.3 — Quality Measurement Checklist
+### Step 6.2 — Live two-machine demo (needs A + B)
 
-Run these measurements and record results:
+The Phase 4/5 daemons already do everything the original `demo.sh` sketch
+wanted, via flags that exist today:
 
 ```bash
-# 1. Latency measurement
-# Play a 1kHz click track, record the output, measure delay in samples
-sox -n -r 96000 -b 24 -c 2 click.wav synth 0.001 sine 1000
-./aether_sender ... < click.wav | sox - -n stat  # measure delay
+# 🎧 B — start first
+./aether_receiver --verbose
 
-# 2. Frequency response (NL mode should be flat ±0.1 dB to 48kHz)
-sox -n -r 96000 -b 24 -c 2 sweep.wav synth 10 sweep 20 48000
-# encode + decode, compare spectrum
+# 🖥️ A — Test 1: Near-Lossless
+./aether_sender --target BB:BB:BB:BB:BB:BB --mode nl --verbose
+pw-play --target aether_codec_sink test_hires.flac
 
-# 3. Sustained bitrate logging
-# Add logging to aether_sender:
-# [stats] seq=1234 mode=NL-96K bitrate=1387 kbps loss=0.0%
+# 🖥️ A — Test 2: Perceptual HQ (Ctrl+C the sender above first, then)
+./aether_sender --target BB:BB:BB:BB:BB:BB --mode hq --verbose
+pw-play --target aether_codec_sink test_hires.flac
 
-# 4. THD+N (use REW - Room EQ Wizard, free)
-# Play a pure 1kHz sine, record decoded output, analyze harmonics
+# 🖥️ A — Test 3: Adaptive bitrate while walking away
+./aether_sender --target BB:BB:BB:BB:BB:BB --mode auto --verbose
+pw-play --target aether_codec_sink test_hires.flac
 ```
+
+`aether_sender --verbose` already logs `frames= secs= kbps= mode= rate=`
+(§6.3's "sustained bitrate logging" ask) and `aether_receiver --verbose` logs
+`recv= played= lost= buffer=…ms underruns=` — both exist today, see
+MANUAL_TESTING.md §6.3 and §7.
+
+---
+
+### Step 6.3 — Quality measurement checklist
+
+| # | Measurement | How |
+|---|---|---|
+| 1 | Bitrate (NL/HQ, both modes) | `aether_encode --mode nl\|hq` prints it directly (single machine); or `aether_sender --verbose` over a live link |
+| 2 | SNR full-band / audible-band | `compare_spectra.py` (single machine, §6.1) |
+| 3 | Bit-exactness (NL) | `compare_spectra.py` reports `Lossless (>120dB): YES`, or raw-PCM `cmp` as shown in §6.1 |
+| 4 | Packet loss / underruns over BT | `aether_receiver --verbose` `lost=`/`underruns=` fields (needs A+B) |
+| 5 | Latency | **Needs real hardware** — a click track played on A, captured acoustically or via loopback cable on B, delay measured in samples. Not automatable on one dev machine; no tooling added for this in Phase 6. Record the result manually in the table below once measured. |
+| 6 | Frequency response sweep | `sox synth sweep` → `aether_encode`/`decode` → inspect the spectrogram PNG from `compare_spectra.py` |
+| 7 | THD+N, MUSHRA listening score, LDAC comparison | **Needs real hardware/listening test** (REW, a second BT device that actually speaks A2DP/LDAC, human listeners) — out of scope for this codebase's tooling; record manually |
 
 ---
 
@@ -2220,7 +2223,7 @@ sox -n -r 96000 -b 24 -c 2 sweep.wav synth 10 sweep 20 48000
 |---|---|---|---|---|
 | Effective bitrate | ___ kbps | ___ kbps | 990 kbps | >900 kbps |
 | Lossless | YES / NO | NO | NO | NL: YES |
-| SNR | ___ dB | ___ dB | ~85 dB | NL: >120 dB |
+| SNR (audible-band) | ___ dB | ___ dB | ~85 dB | NL: >120 dB |
 | Latency | ___ ms | ___ ms | ~200 ms | <80 ms |
 | Freq response | ±___ dB | ±___ dB | ±0.5 dB | ±0.2 dB |
 | Packet loss at 2m | ___% | ___% | N/A | <0.5% |
@@ -2229,13 +2232,20 @@ sox -n -r 96000 -b 24 -c 2 sweep.wav synth 10 sweep 20 48000
 
 ### ✅ Phase 6 Final Checkpoint
 
-- [ ] Full 60-second music playback with zero dropouts in good BT conditions
-- [ ] NL mode SNR > 120 dB (effectively lossless, confirming bit-perfect decode)
-- [ ] HQ mode sounds transparent on headphones (MUSHRA score target: >85)
-- [ ] Spectral comparison PNG generated showing difference signal
-- [ ] ABR demo works: mode changes audibly gracefully during range test
-- [ ] Latency measured and recorded: ___ ms
-- [ ] Bitrate logged and confirmed within target range
+- [x] `aether_encode`/`aether_decode` built and verified: NL round-trip is
+      bit-for-bit identical raw PCM (24-bit stereo tone, and a mono 16-bit
+      odd-length clip); HQ round-trip (with `--shift 512`) measured
+      **28.4 dB** audible-band SNR on a tonal signal, matching
+      `test_codec_hq`'s ~27.5 dB reference
+- [x] `compare_spectra.py` built: reports full-band + audible-band SNR and
+      (with `matplotlib`) a 3-panel spectrogram PNG; verified against both NL
+      and HQ output on this machine
+- [ ] Full 60-second music playback with zero dropouts in good BT conditions — needs second laptop
+- [ ] NL mode SNR > 120 dB on real music (verified on a synthetic tone above; re-verify on a real track once available)
+- [ ] HQ mode sounds transparent on headphones (MUSHRA score target: >85) — needs a listening test, pending
+- [ ] ABR demo works: mode changes audibly gracefully during range test — needs second laptop (single-machine `--abr-demo` already verified in Phase 5)
+- [ ] Latency measured and recorded: ___ ms — needs real hardware, pending
+- [x] Bitrate logged and confirmed within target range — see `aether_encode` output above and Phase 3's `test_codec_hq` numbers (900–1,100 kbps HQ broadband target)
 
 ---
 
@@ -2244,23 +2254,27 @@ sox -n -r 96000 -b 24 -c 2 sweep.wav synth 10 sweep 20 48000
 ```bash
 # Build everything
 cd ~/aethercodec && mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
+cmake .. -DCMAKE_BUILD_TYPE=Release -DAETHER_ENABLE_PIPEWIRE=ON -DAETHER_ENABLE_ALSA=OFF
+make -j$(nproc)
 
 # Run tests
-make test
+ctest --output-on-failure
 
 # Start receiver (Laptop B)
-./src/daemon/aether_receiver
+./src/aether_receiver --verbose
 
 # Start sender (Laptop A — replace with Laptop B's BT address)
-./src/daemon/aether_sender --target AA:BB:CC:DD:EE:FF --mode nl
+./src/aether_sender --target AA:BB:CC:DD:EE:FF --mode nl --verbose
 
-# Monitor status
-./tools/aether_status --target AA:BB:CC:DD:EE:FF
-
-# Analyze output quality
-python3 tools/compare_spectra.py original.wav decoded.wav "AetherCodec NL"
+# Single-machine file-based quality check (no second laptop needed)
+./tools/aether_encode  input.wav /tmp/out.aether --mode nl
+./tools/aether_decode  /tmp/out.aether /tmp/decoded.wav
+python3 ../tools/compare_spectra.py input.wav /tmp/decoded.wav "AetherCodec NL"
 ```
+
+> There is no `aether_status` tool — link/quality status is what
+> `aether_sender --verbose` / `aether_receiver --verbose` print
+> (`[stats] frames= kbps= mode= rate=` / `recv= played= lost= underruns=`).
 
 ---
 
