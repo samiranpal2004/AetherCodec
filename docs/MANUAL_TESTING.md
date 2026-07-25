@@ -496,7 +496,184 @@ Record these manually in the comparison table
 
 ---
 
-## 9. Common issues
+## 9. Full two-laptop test run (A + B)
+
+This is the consolidated bring-up procedure — everything that needs both
+machines, in the order to do it. **Each step gates the next**: if transport
+fails, nothing above it can work, so don't skip ahead. The single-machine tests
+(§1–2, §5–7) should already pass on **both** laptops before you start here.
+
+> Throughout: **A** = sender, **B** = receiver. Commands are labelled 🖥️ **A**
+> or 🎧 **B**. You only ever need **B's** Bluetooth address — A connects to B,
+> and A reads the RSSI of its link *to* B. B just listens.
+
+### 9.0 Prerequisites (both laptops)
+
+On **each** laptop:
+
+```bash
+# same checkout, clean build, all unit tests green
+cd ~/aethercodec/build && ctest        # expect 9/9
+
+# PipeWire session is up
+pgrep -a pipewire                      # must show a running server
+
+# note this machine's Bluetooth address
+hciconfig hci0 | grep "BD Address"
+```
+
+Write down both addresses. Below, `BB:BB:BB:BB:BB:BB` is **B's** address.
+
+> Both laptops must run the **same build** — the wire format has no version
+> negotiation, so a stale binary on one side will mis-decode. Rebuild both from
+> the same commit if in doubt.
+
+### 9.1 Pair A and B (once)
+
+Skip if `bluetoothctl info BB:BB:BB:BB:BB:BB` on A already shows
+`Paired: yes` / `Trusted: yes`.
+
+```bash
+# 🎧 B — make discoverable
+bluetoothctl
+  power on
+  agent on
+  discoverable on
+  pairable on
+
+# 🖥️ A — pair, trust, connect
+bluetoothctl
+  power on
+  agent on
+  scan on            # wait for B to appear, then:
+  pair  BB:BB:BB:BB:BB:BB
+  trust BB:BB:BB:BB:BB:BB
+  connect BB:BB:BB:BB:BB:BB
+```
+
+**Gate:** `bluetoothctl info BB:BB:BB:BB:BB:BB` on A shows
+`Paired: yes, Trusted: yes, Connected: yes`. If pairing fails, nothing below
+will work — fix it here.
+
+### 9.2 Transport sanity — Phase 1 (do this first, always)
+
+Prove the raw pipe before involving the codec. Details in §3.
+
+```bash
+# 🎧 B                         # 🖥️ A
+./tools/rfcomm_ping server     ./tools/rfcomm_ping client BB:BB:BB:BB:BB:BB
+```
+**Gate:** B prints `seq=0 … seq=9`. `Connection refused` on A ⇒ B side not
+started first, or channel busy (`pkill rfcomm_ping` on B).
+
+```bash
+# 🎧 B                          # 🖥️ A
+./tools/rfcomm_bench server      ./tools/rfcomm_bench client BB:BB:BB:BB:BB:BB
+```
+**Record the throughput.** This is the ceiling everything else lives under:
+- ≥ 1000 kbps → 24/96 NL is feasible.
+- 600–1000 kbps → expect NL-48k / HQ under load.
+- < 600 kbps → no EDR; NL-96k will underrun, use `--mode auto` or `hq`.
+
+Measured throughput: **_1003_____ kbps**
+
+Optional — raw PCM audio (§3.3) confirms B's DAC/headphones work end to end.
+
+### 9.3 Codec streaming — Phase 4
+
+Start **B first** (it registers playback, then waits on RFCOMM); then **A**
+(it connects, then registers the sink); then play into the sink on A.
+
+```bash
+# 🎧 B — leave this running; watch its stats
+./src/aether_receiver --verbose
+
+# 🖥️ A — near-lossless
+./src/aether_sender --target BB:BB:BB:BB:BB:BB --mode nl --verbose
+
+# 🖥️ A — third terminal: play a hi-res file INTO our sink
+#   --target is mandatory: without it the audio goes to A's own speakers, not B.
+pw-play --target aether_codec_sink your_music.flac
+```
+
+**Expect:**
+- Audio on **B's** headphones.
+- 🖥️ A: `[stats] frames= … kbps= mode=NL rate=96000` climbing.
+- 🎧 B: `[stats] recv= played= lost=0 buffer=…ms underruns=0`.
+
+**Gate:** `lost=0` and `underruns=0` over ~30 s. Rising `underruns` ⇒ the link
+can't sustain NL-96k (compare against 9.2's number) — that's expected on a slow
+link and is what §9.4's ABR handles. Rising `lost` ⇒ packets dropping on the
+air; the receiver conceals with silence.
+
+Then repeat in **HQ** (Ctrl+C the sender first — fixed modes don't switch live):
+
+```bash
+# 🖥️ A
+./src/aether_sender --target BB:BB:BB:BB:BB:BB --mode hq --verbose
+pw-play --target aether_codec_sink your_music.flac
+```
+HQ should sound transparent and sit lower/steadier on bitrate than NL.
+
+### 9.4 Adaptive bitrate range test — Phase 5
+
+Grant the sender RSSI access once, then run in `auto`:
+
+```bash
+# 🖥️ A — once (HCI access needs CAP_NET_RAW)
+sudo setcap cap_net_raw+ep ./src/aether_sender
+
+# 🎧 B
+./src/aether_receiver --verbose
+
+# 🖥️ A
+./src/aether_sender --target BB:BB:BB:BB:BB:BB --mode auto --verbose
+pw-play --target aether_codec_sink your_music.flac
+```
+
+Now **physically walk A away from B** and back, watching both consoles:
+
+- 🖥️ A logs `[abr] NL-96kHz -> NL-48kHz (RSSI=… dBm)` as you move away, stepping
+  down the ladder; walking back **upgrades**, and each upgrade waits ~3 s.
+- 🎧 B logs `[receiver] stream rate -> 48000 Hz, mode=…` following the switches,
+  and audio stays continuous (no dropouts) across them.
+- Cross-check the reading any time with `hcitool rssi BB:BB:BB:BB:BB:BB` on A.
+
+**Expect:** NL-96k held at 0–1 m; graceful step-down by ~5 m+; audio never cuts
+out, only changes quality. If A prints `cannot read RSSI`, the `setcap` didn't
+take (or you rebuilt the binary — re-run it) and ABR holds its current state.
+
+> The live engine drives on **RSSI only** — packet-loss feedback
+> (`CTRL_STATS_REPLY`) isn't implemented yet, so a link that's strong but lossy
+> won't downgrade on its own. See §7.4.
+
+### 9.5 Sustained run + record results
+
+Play a full track (≥ 60 s) in each mode and capture the steady-state numbers:
+
+| Mode | Bitrate (A `[stats]`) | lost | underruns | Audible quality |
+|---|---|---|---|---|
+| NL-96k | | | | |
+| HQ-96k | | | | |
+| auto (range) | | | | |
+
+**Pass:** 60 s continuous in good conditions with `lost=0 underruns=0`, no
+audible glitches, and (auto) graceful mode changes while moving. Transfer these
+into the comparison table in `docs/AetherCodec_IMPLEMENTATION.md` §6.4.
+
+### 9.6 Two-laptop checklist
+
+- [ ] 9.1 Paired + trusted + connected (`bluetoothctl info`)
+- [ ] 9.2 `rfcomm_ping` — 10 pings on B
+- [ ] 9.2 `rfcomm_bench` — throughput recorded: ______ kbps
+- [ ] 9.3 NL streaming — audio on B, `lost=0 underruns=0` over 30 s
+- [ ] 9.3 HQ streaming — transparent, steady bitrate
+- [ ] 9.4 `auto` — `[abr]` steps down/up while walking; B follows the rate; no dropouts
+- [ ] 9.5 60 s sustained per mode — results recorded in §6.4 table
+
+---
+
+## 10. Common issues
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -514,10 +691,14 @@ Record these manually in the comparison table
 | ABR skips a rung | sweep crossed two bands in one commit | Expected — see note in §7.3 |
 | HQ `compare_spectra.py` SNR reads ~−5 dB | forgot `--shift 512` | See §8.1 — HQ has a one-hop OLA decode delay |
 | `aether_decode` errors on a plain WAV/RFCOMM dump | not an `.aether` file | It needs the 8-byte `aether_encode` file header, not a raw packet dump |
+| A `connect` fails with `Host is down`/`Connection timed out` | A and B not paired, or B not connected | Redo §9.1; confirm `bluetoothctl info` shows `Connected: yes` |
+| Streaming works but audio comes out of **A's** speakers | forgot `--target aether_codec_sink` on `pw-play` | Our sink has priority −1, so A's real output stays default; always target the sink |
+| B decodes garbage / loud noise | mismatched builds on A and B | Rebuild both from the same commit (no wire-format versioning) |
+| Two-machine `garbled after a while`, `underruns` climbing | link below the codec's bitrate | Check §9.2 throughput; use `--mode auto` or `hq` |
 
 ---
 
-## 10. Quick checklist
+## 11. Quick checklist
 
 - [ ] `make` — clean build, no warnings
 - [ ] `ctest` — 9/9 pass

@@ -199,6 +199,13 @@ cmake ..
 
 ### ✅ Phase 0 Checkpoint
 
+- [x] Packages installed (Laptop A / this machine) — bluez 5.64, libpipewire-0.3 0.3.48, gcc 11, cmake 3.22.1
+- [x] Packages installed (Laptop B) — bluez 5.72, gcc 13.3.0, cmake 3.28.3 (build uses `-DAETHER_ENABLE_PIPEWIRE=OFF -DAETHER_ENABLE_ALSA=OFF`, so libpipewire-dev/alsa-dev not required to build yet on this machine)
+- [x] `hciconfig hci0` shows a BD Address (5C:F3:70:6A:0F:CB) — Laptop A
+- [x] `hciconfig hci0` shows a BD Address (FC:B0:DE:80:0C:B4) — Laptop B
+- [ ] Laptops are paired and trusted with each other — Laptop B set discoverable/pairable and waiting; needs Laptop A present to run `pair`/`trust`/`connect`
+- [x] `cmake ..` runs without errors (Laptop A and Laptop B, both `ctest` 3/3 passing on Laptop B)
+- [x] Project directory structure exists (both laptops, same git repo)
 - [x] Packages installed (Laptop A / this machine) — Ubuntu 26.04 LTS, bluez 5.85,
       libpipewire-0.3 1.6.2, fftw3f 3.3.10, gcc 15.2.0, cmake 4.2.3
 - [x] `hciconfig hci0` shows a BD Address (C0:35:32:24:8E:D0) — this machine
