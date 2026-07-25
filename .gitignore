@@ -1,0 +1,16 @@
+# Build output
+/build/
+*.o
+*.a
+*.so
+
+# Test / demo artifacts
+*.aether
+*.wav
+spectra_comparison.png
+*_spec.png
+
+# Editor / OS
+.vscode/
+*.swp
+.DS_Store
