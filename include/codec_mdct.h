@@ -50,4 +50,13 @@ void mdct_band_steps(const float *mask, float *step_out);
 float mdct_sf_to_step(int sf_index);
 int   mdct_step_to_sf(float step);
 
+/* Signal-to-mask ratio in dB — HQ's single rate/quality knob (~6 dB per bit per
+   significant coefficient). Clamped to [6, 30]; default 30. Encoder-side only:
+   the wire format carries the resulting scalefactors, so the decoder neither
+   knows nor needs this. The sender adjusts it in a closed loop against link
+   congestion, because a fixed quality means an uncontrolled bitrate — and
+   dropped frames are far more audible than coarser quantisation. */
+void  mdct_set_smr_db(float db);
+float mdct_get_smr_db(void);
+
 #endif /* CODEC_MDCT_H */

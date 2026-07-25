@@ -62,13 +62,25 @@ static const uint8_t* decode_channel_nl(const uint8_t *p, const uint8_t *end,
    relative to the encoder's input, which is inherent to overlap-add). */
 static const uint8_t* decode_channel_hq(const uint8_t *p, const uint8_t *end,
                                         float *ola, float *out) {
-    if (end - p < 3) return NULL;
+    /* Band mask: bit b set means band b was coded. Unset bands are all-zero and
+       carry neither a scalefactor nor any coefficients (see the encoder). */
+    if (end - p < 8 + 3) return NULL;
+    uint64_t band_mask = 0;
+    for (int i = 0; i < 8; i++) band_mask |= (uint64_t)(*p++) << (8 * i);
+
+    int nsf = 0, nq = 0;
+    for (int b = 0; b < BARK_BANDS; b++) {
+        if (!((band_mask >> b) & 1)) continue;
+        nsf++;
+        nq += mdct_band_start(b + 1) - mdct_band_start(b);
+    }
+
     int sfk = *p++;
     uint16_t sl; memcpy(&sl, p, 2); p += 2;
     if (end - p < sl) return NULL;
 
     int32_t sf_delta[BARK_BANDS];
-    if (rice_decode(p, sl, sfk, BARK_BANDS, sf_delta) < 0) return NULL;
+    if (nsf > 0 && rice_decode(p, sl, sfk, nsf, sf_delta) < 0) return NULL;
     p += sl;
 
     if (end - p < 3) return NULL;
@@ -77,19 +89,22 @@ static const uint8_t* decode_channel_hq(const uint8_t *p, const uint8_t *end,
     if (end - p < cl) return NULL;
 
     int32_t q[MDCT_COEFFS];
-    if (rice_decode(p, cl, cfk, MDCT_COEFFS, q) < 0) return NULL;
+    if (nq > 0 && rice_decode(p, cl, cfk, nq, q) < 0) return NULL;
     p += cl;
 
-    /* Dequantise band by band using the cumulative scalefactors. */
+    /* Dequantise the coded bands using the cumulative scalefactors; the rest
+       stay zero. */
     float coeffs[MDCT_COEFFS];
-    int sf = 0;
+    memset(coeffs, 0, sizeof(coeffs));
+    int sf = 0, si = 0, qi = 0;
     for (int b = 0; b < BARK_BANDS; b++) {
-        sf += sf_delta[b];
+        if (!((band_mask >> b) & 1)) continue;
+        sf += sf_delta[si++];
         if (sf < 0)   sf = 0;
         if (sf > 255) sf = 255;
         float s = mdct_sf_to_step(sf);
         for (int k = mdct_band_start(b); k < mdct_band_start(b + 1); k++)
-            coeffs[k] = (float)q[k] * s;
+            coeffs[k] = (float)q[qi++] * s;
     }
 
     float y[MDCT_SIZE];

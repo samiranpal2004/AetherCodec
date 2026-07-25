@@ -2156,6 +2156,55 @@ only appear once real packets cross a real link.
    DAC half-filled buffers (continuous crackle instead of one clean gap). It is
    now all-or-nothing per quantum.
 
+#### Second two-laptop run: HQ still crackled — rate control added (2026-07-25)
+
+With the five defects above fixed, `auto` became listenable but fixed `nl` and
+`hq` still crackled. The second capture showed why, and it was not a bug in the
+usual sense — it was a missing control loop.
+
+- **HQ-96k's bitrate is uncontrolled.** It opened at 444 kbps on sparse material
+  and drifted past 860 kbps as the music got denser, overran the link and
+  dropped ~20% of frames. Even HQ-48k, the bottom rung, sat *permanently*
+  congested at ~620 kbps with the queue pinned at 300–490 ms. A fixed SMR means
+  a fixed quality, and therefore a bitrate nobody is steering.
+- **The measured link is half the benched link.** `rfcomm_bench` read
+  1,003 kbps, but the delivered rate over a sustained 90 s stream was
+  **~525 kbps** (7,117 packets × ~831 B / 90 s). A short burst is a best case;
+  2.4 GHz Wi-Fi coexistence on either laptop roughly halves it. The sender now
+  measures and reports this as `link=`, so the real ceiling is visible rather
+  than inferred.
+
+Three changes:
+
+6. **HQ gained a 64-bit band mask.** Rice never codes a symbol in zero bits — a
+   quantised-to-zero coefficient still costs the unary terminator. At 96 kHz the
+   ATH correctly zeroes everything above ~17.6 kHz, ~63% of the 512 bins, so
+   those dead bins put a hard **~500 kbps floor** under HQ-96k that no amount of
+   coarsening could get below. Skipping them costs 8 bytes per channel per frame.
+   Measured effect at *identical* SNR (27.6 dB audible): broadband
+   **1050 → 595 kbps**, tonal **540 → 178 kbps**, and the reachable floor
+   **499 → 157 kbps**. This is a wire-format change — rebuild both laptops.
+
+7. **Closed-loop rate control on SMR** (`abr_smr_step`, pure and unit-tested).
+   AIMD against send-queue depth: +0.4 dB per 250 ms tick while the queue drains
+   freely, and a proportional cut (1 + depth/100 dB, capped at 6) the moment it
+   backs up or drops. Clamped to [12, 30] dB — the codec allows 6 dB but measured
+   audible SNR there is ~1.7 dB, which is noise and worse than the dropouts it
+   would be avoiding. Below 12 dB the right move is halving the sample rate,
+   which buys the same bitrate back at full quality, so the controller stops and
+   lets the ladder take the step. `test_abr` verifies convergence against
+   simulated 900 / 520 / 300 kbps links (settles at SMR 30 / 23.7 / 15 dB).
+
+8. **ABR's upward probe is gated on real headroom.** The congestion ceiling used
+   to relax purely on a 20 s timer, so `auto` re-probed a mode the link had
+   already proven it could not carry, forever, at one audible blip per probe.
+   `abr_set_headroom()` now requires the queue to be draining *and* the encoder
+   to have no quality left to spend before the ceiling moves.
+
+Also: `rfcomm_send_packet` no longer hand-chunks at `AETHER_RFCOMM_MTU`. BlueZ's
+`rfcomm_sock_sendmsg` already fragments at the negotiated DLC MTU, so
+pre-splitting only forced extra RFCOMM frames whenever that MTU was larger.
+
 > **NL-96k does not fit a ~1 Mbps RFCOMM link, and no buffering changes that.**
 > The run measured **~3,100 kbps** for NL-96k on real music against a
 > `rfcomm_bench` ceiling of **1,003 kbps**. The PRD's ~1,400 kbps assumes LPC
