@@ -11,6 +11,7 @@
 #include "codec_lpc.h"
 #include "audio_ring.h"
 #include "pw_io.h"
+#include "resample.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,8 +52,15 @@ int main(int argc, char *argv[]) {
     RFCOMMTransport *t = rfcomm_listen(RFCOMM_CHANNEL);
     if (!t) { fprintf(stderr, "[receiver] RFCOMM listen failed\n"); return 1; }
 
+    /* The playback stream is always 96 kHz; when ABR drops the stream to 48 kHz
+       we interpolate back up so the OS-facing format never changes. */
+    Resampler up;
+    resample_init(&up, CHANNELS);
+    int last_rate = SAMPLE_RATE;
+
     AetherPacket pkt;
     int32_t out[LPC_FRAME_SIZE * CHANNELS];
+    int32_t up_out[LPC_FRAME_SIZE * 2 * CHANNELS];
     unsigned long got = 0, played = 0, lost = 0;
 
     while (running) {
@@ -79,7 +87,20 @@ int main(int argc, char *argv[]) {
             }
             int n = aether_decoder_decode(dec, p, out, LPC_FRAME_SIZE * CHANNELS);
             if (n > 0) {
-                audio_ring_write(&play_ring, out, (uint32_t)n);
+                int rate = (p->hdr.sample_rate == AETHER_RATE_48000) ? 48000
+                                                                     : SAMPLE_RATE;
+                if (rate != last_rate) {
+                    printf("[receiver] stream rate -> %d Hz, mode=%s\n", rate,
+                           p->hdr.mode == AETHER_MODE_NL ? "NL" : "HQ");
+                    resample_reset(&up);
+                    last_rate = rate;
+                }
+                if (rate != SAMPLE_RATE) {
+                    int m = resample_up2(&up, out, n / CHANNELS, up_out);
+                    audio_ring_write(&play_ring, up_out, (uint32_t)m * CHANNELS);
+                } else {
+                    audio_ring_write(&play_ring, out, (uint32_t)n);
+                }
                 played++;
             }
         }

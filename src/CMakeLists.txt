@@ -39,9 +39,13 @@ target_link_libraries(aether_codec PUBLIC aether_transport ${FFTW_LIBRARIES} m)
 add_library(aether_runtime STATIC
     os/audio_ring.c
     jitter/jitter_buf.c
+    abr/abr_ctrl.c
+    abr/bt_rssi.c
+    abr/resample.c
 )
 target_include_directories(aether_runtime PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(aether_runtime PUBLIC aether_transport Threads::Threads)
+# bt_rssi needs libbluetooth (via aether_transport); resample needs m.
+target_link_libraries(aether_runtime PUBLIC aether_transport Threads::Threads m)
 
 # --- Phase 4: PipeWire OS integration + daemons ---
 if(AETHER_ENABLE_PIPEWIRE)
