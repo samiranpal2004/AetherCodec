@@ -2449,6 +2449,81 @@ MANUAL_TESTING.md §6.3 and §7.
 
 ---
 
+## Phase 7 — Link-Efficiency Upgrades (2026-07-25)
+
+> **Context.** Field testing showed every playback problem tracing to one root
+> cause: the measured sustained RFCOMM throughput (a few hundred kbps on the
+> user's pair) sits far below the PRD's assumed 1,000–1,500 kbps. These five
+> changes squeeze more quality out of whatever the link actually carries and
+> give ABR a real receiver-side loss signal. **Wire format changed** — both
+> laptops must be rebuilt from the same commit (no version negotiation).
+
+### 7.1 NL wasted-bits detection (FLAC-style)
+
+Per channel per frame, the low-order zero bits shared by every sample are
+shifted out before LPC and restored after synthesis (`wasted: u8` on the wire).
+16-bit masters in the 24-bit container drop ~8 bits/sample of pure padding.
+Measured (`test_codec_nl`): **2.36x vs 1.36x** on 16-in-24 content — bit-perfect.
+
+### 7.2 Lossless mid/side stereo (NL)
+
+Per frame, the encoder estimates Rice cost of L/R vs the integer pair
+`m=(l+r)>>1, s=l-r` (the parity of `s` recovers the shifted-out bit — exact)
+and codes the cheaper pairing (`flags` bit0). Correlated content wins 10–30%;
+panned/uncorrelated content stays L/R, so it can never lose. Measured: 1.72x vs
+1.52x on correlated stereo, still 0 mismatches everywhere.
+
+### 7.3 HQ mid/side (transform domain)
+
+Same per-frame decision for HQ, but applied to MDCT *coefficients*
+(`m=(L+R)/2, s=(L-R)/2`), not samples: the transform is linear so they're
+equivalent, and doing it after the MDCT keeps the decoder's overlap-add history
+in L/R space, letting the decision flip freely between frames.
+
+### 7.4 HQ frame batching (4 hops per packet)
+
+One hop per packet meant 187 packets/s at 96 kHz — ~36 kbps of header+CRC,
+15%+ of a weak link. The daemons now send `AETHER_HQ_HOPS_PER_PKT = 4` MDCT
+hops per packet (2048 samples, same duration as an NL frame). Measured
+(`test_codec_hq`): 598 → 569 kbps at *identical* SNR. The encoder accepts any
+multiple of `MDCT_HOP` up to `LPC_FRAME_SIZE`; the payload's leading
+`frame_samples` is the total, so the jitter buffer's level maths stay right.
+
+### 7.5 L2CAP SOCK_SEQPACKET transport (experimental, `--l2cap`)
+
+`l2cap_listen`/`l2cap_connect` (PSM `0x1001`, one AetherPacket per SDU,
+imtu/omtu raised to 65535) behind the same transport handle; both daemons and
+`rfcomm_bench` take `--l2cap`. Removes RFCOMM framing + credit flow control
+from the path. Gain is hardware-dependent — bench both variants on the real
+pair before switching; RFCOMM remains the default.
+
+### 7.6 CTRL_STATS_REPLY back-channel
+
+The receiver now sends `AetherStatsReply` (loss %, buffer ms, underruns) every
+~500 ms up the same socket; the sender's new reader thread (which must run in
+every mode — an undrained reverse path would eventually block the receiver's
+send and stall playback) feeds it to `abr_update_congested()` as the loss the
+classifier's 1/3/8% thresholds always expected, and prints it as
+`rxloss=`/`rxbuf=` in `[stats]`. A report older than 2 s counts as "no data",
+so a stalled reverse path can't wedge ABR.
+
+### ✅ Phase 7 Checkpoint
+
+- [x] `test_codec_nl`: mixed / correlated / panned / 16-in-24 all bit-perfect;
+      mid/side gain 1.72x vs 1.52x; wasted-bits gain 2.36x vs 1.36x
+- [x] `test_codec_hq`: batched 4-hop packets decode at identical SNR,
+      598 → 569 kbps; SMR sweep still monotone (598 → 202 kbps)
+- [x] `test_packet`: CTRL_STATS_REPLY pack/unpack round-trip
+- [x] Full suite: 10/10, clean build, no warnings
+- [ ] `--l2cap` benchmarked against RFCOMM on the real pair (`rfcomm_bench
+      [--l2cap]`) — needs second paired laptop
+- [ ] `rxloss=` observed tracking receiver `lost=` on a live link — needs
+      second paired laptop
+- [ ] Two-machine A/B: HQ bitrate/quality before vs after mid/side + batching
+      on real music — needs second paired laptop
+
+---
+
 ## Quick Reference: Build & Run
 
 ```bash

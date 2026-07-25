@@ -35,6 +35,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -74,6 +75,23 @@ static _Atomic int pending_state = -1;
    timer and re-probes a mode the link demonstrably cannot carry every 20 s —
    each probe being an audible blip. */
 static _Atomic int link_headroom = 0;
+
+/* Latest CTRL_STATS_REPLY from the receiver (see stats_recv_thread). Loss is
+   the receiver's own sequence-gap measurement — the signal abr_classify's loss
+   thresholds were designed for but never had until this back-channel existed.
+   A reading older than STATS_FRESH_MS is treated as "no data" (loss 0), so a
+   stalled reverse path can never wedge ABR in a degraded state. */
+#define STATS_FRESH_MS 2000
+static _Atomic int      rx_loss_x10   = 0;    /* percent * 10 */
+static _Atomic int      rx_buffer_ms  = -1;
+static _Atomic uint64_t rx_stats_ms   = 0;    /* when it arrived (ms) */
+
+static float rx_loss_pct_fresh(void) {
+    uint64_t now = aether_timestamp_us() / 1000ULL;
+    uint64_t at  = atomic_load(&rx_stats_ms);
+    if (at == 0 || now - at > STATS_FRESH_MS) return 0.0f;
+    return (float)atomic_load(&rx_loss_x10) / 10.0f;
+}
 
 /* ---- send queue --------------------------------------------------------- */
 
@@ -220,6 +238,28 @@ static void *send_thread(void *arg) {
     return NULL;
 }
 
+/* Drains the reverse direction of the socket. This must run in EVERY mode, not
+   just auto: if nobody reads, the receiver's periodic stats replies eventually
+   fill the socket buffers and block the receiver's send — stalling its recv
+   loop and therefore playback. Runs even when the payload is ignored. */
+static void *stats_recv_thread(void *arg) {
+    struct send_args *sa = arg;
+    static AetherPacket pkt;   /* 64 KB — keep off the thread stack */
+    while (running) {
+        if (rfcomm_recv_packet(sa->t, &pkt) < 0) break;
+        if (pkt.hdr.mode == AETHER_MODE_CTRL &&
+            pkt.hdr.payload_size >= sizeof(AetherStatsReply) &&
+            pkt.payload[0] == CTRL_STATS_REPLY) {
+            AetherStatsReply sr;
+            memcpy(&sr, pkt.payload, sizeof(sr));
+            atomic_store(&rx_loss_x10,  (int)sr.loss_x10);
+            atomic_store(&rx_buffer_ms, (int)sr.buffer_ms);
+            atomic_store(&rx_stats_ms, aether_timestamp_us() / 1000ULL);
+        }
+    }
+    return NULL;
+}
+
 /* ---- ABR ---------------------------------------------------------------- */
 
 static ABRCtrl *g_abr;
@@ -274,9 +314,13 @@ static void *abr_thread(void *arg) {
             last_dropped = d;
         }
 
+        /* Receiver-reported loss (CTRL_STATS_REPLY). Real on-air/queue loss as
+           the receiver counted it; 0 when no fresh report exists. */
+        float loss = rx_loss_pct_fresh();
+
         ABRState before = abr_current_state(g_abr);
         abr_set_headroom(g_abr, atomic_load(&link_headroom));
-        abr_update_congested(g_abr, rssi, 0.0f, congested,
+        abr_update_congested(g_abr, rssi, loss, congested,
                              aether_timestamp_us() / 1000ULL);
         ABRState after = abr_current_state(g_abr);
 
@@ -300,10 +344,12 @@ static void *abr_thread(void *arg) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "Usage: %s --target BT_ADDR [--mode nl|hq|auto] [--verbose]\n"
+        "Usage: %s --target BT_ADDR [--mode nl|hq|auto] [--l2cap] [--verbose]\n"
         "       %s --loopback       [--mode nl|hq|auto] [--verbose] [--no-play]\n"
         "\n"
         "  --mode auto  adaptive bitrate: RSSI/loss + send-queue backpressure\n"
+        "  --l2cap      use L2CAP SOCK_SEQPACKET instead of RFCOMM (experimental;\n"
+        "               receiver must also run with --l2cap)\n"
         "  --abr-demo   with --mode auto, sweep a simulated RSSI (single machine)\n"
         "  --no-play    loopback without a playback stream (avoids feeding our own\n"
         "               default sink back into itself on a machine with no real\n"
@@ -314,13 +360,14 @@ static void usage(const char *argv0) {
 int main(int argc, char *argv[]) {
     const char *target = NULL;
     int mode = AETHER_MODE_NL, loopback = 0, verbose = 0, no_play = 0;
-    int auto_mode = 0, abr_demo = 0;
+    int auto_mode = 0, abr_demo = 0, use_l2cap = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--target") && i + 1 < argc)      target = argv[++i];
         else if (!strcmp(argv[i], "--loopback"))               loopback = 1;
         else if (!strcmp(argv[i], "--no-play"))                no_play = 1;
         else if (!strcmp(argv[i], "--abr-demo"))               abr_demo = 1;
+        else if (!strcmp(argv[i], "--l2cap"))                  use_l2cap = 1;
         else if (!strcmp(argv[i], "--verbose"))                verbose = 1;
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char *m = argv[++i];
@@ -352,16 +399,23 @@ int main(int argc, char *argv[]) {
     }
 
     RFCOMMTransport *t = NULL;
-    pthread_t send_tid; int send_running = 0;
+    pthread_t send_tid, stats_tid;
+    int send_running = 0, stats_running = 0;
     struct send_args sa;
     if (!loopback) {
-        t = rfcomm_connect(target, RFCOMM_CHANNEL);
-        if (!t) { fprintf(stderr, "[sender] RFCOMM connect failed\n"); return 1; }
+        t = use_l2cap ? l2cap_connect(target, AETHER_L2CAP_PSM)
+                      : rfcomm_connect(target, RFCOMM_CHANNEL);
+        if (!t) { fprintf(stderr, "[sender] %s connect failed\n",
+                          use_l2cap ? "L2CAP" : "RFCOMM"); return 1; }
         if (sendq_init(&g_sendq)) { fprintf(stderr, "sendq alloc failed\n"); return 1; }
         sa.t = t;
         if (pthread_create(&send_tid, NULL, send_thread, &sa) == 0)
             send_running = 1;
         else { fprintf(stderr, "send thread failed\n"); return 1; }
+        /* Reverse-path reader: consumes the receiver's stats replies (and must
+           run regardless of mode so the socket's rx direction never backs up). */
+        if (pthread_create(&stats_tid, NULL, stats_recv_thread, &sa) == 0)
+            stats_running = 1;
     }
 
     AetherEncoder *enc = aether_encoder_create(mode, rate, BIT_DEPTH, CHANNELS);
@@ -495,7 +549,12 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        const int coded_frame = (mode == AETHER_MODE_NL) ? LPC_FRAME_SIZE : MDCT_HOP;
+        /* NL frames are 2048 samples; HQ batches 4 MDCT hops to the same 2048
+           so both modes pay one header+CRC per ~21 ms instead of HQ paying
+           four times as many (see AETHER_HQ_HOPS_PER_PKT). */
+        const int coded_frame = (mode == AETHER_MODE_NL)
+                              ? LPC_FRAME_SIZE
+                              : MDCT_HOP * AETHER_HQ_HOPS_PER_PKT;
         const int ratio       = SAMPLE_RATE / rate;
         const int cap_frames  = coded_frame * ratio;
 
@@ -547,14 +606,18 @@ int main(int argc, char *argv[]) {
                        mode == AETHER_MODE_NL ? "NL" : "HQ", rate);
             else if (mode == AETHER_MODE_HQ)
                 printf("[stats] frames=%lu  %.1fs  %.0f kbps  mode=HQ rate=%d  "
-                       "smr=%.0fdB link=%.0f kbps  queue=%dms dropped=%lu\n",
+                       "smr=%.0fdB link=%.0f kbps  queue=%dms dropped=%lu  "
+                       "rxloss=%.1f%% rxbuf=%dms\n",
                        frames, wall_s, kbps, rate, mdct_get_smr_db(), link_kbps,
-                       sendq_depth_ms(&g_sendq), sendq_dropped_total(&g_sendq));
+                       sendq_depth_ms(&g_sendq), sendq_dropped_total(&g_sendq),
+                       rx_loss_pct_fresh(), atomic_load(&rx_buffer_ms));
             else
                 printf("[stats] frames=%lu  %.1fs  %.0f kbps  mode=NL rate=%d  "
-                       "link=%.0f kbps  queue=%dms dropped=%lu\n",
+                       "link=%.0f kbps  queue=%dms dropped=%lu  "
+                       "rxloss=%.1f%% rxbuf=%dms\n",
                        frames, wall_s, kbps, rate, link_kbps,
-                       sendq_depth_ms(&g_sendq), sendq_dropped_total(&g_sendq));
+                       sendq_depth_ms(&g_sendq), sendq_dropped_total(&g_sendq),
+                       rx_loss_pct_fresh(), atomic_load(&rx_buffer_ms));
             fflush(stdout);
 
             /* A fixed mode that keeps dropping is simply over the link's
@@ -593,6 +656,11 @@ int main(int argc, char *argv[]) {
     if (abr_running) pthread_join(abr_tid, NULL);
     if (g_abr) abr_ctrl_destroy(g_abr);
     if (send_running) { sendq_close(&g_sendq); pthread_join(send_tid, NULL); }
+    if (stats_running) {
+        /* Unblock the reader's recv() so the join can't hang. */
+        if (t) shutdown(rfcomm_get_fd(t), SHUT_RDWR);
+        pthread_join(stats_tid, NULL);
+    }
     if (!loopback) sendq_free(&g_sendq);
     if (play) pw_play_stop(play);
     pw_sink_stop(sink);

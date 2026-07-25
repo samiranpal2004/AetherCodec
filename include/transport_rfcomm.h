@@ -5,6 +5,9 @@
 
 #define RFCOMM_CHANNEL  1
 
+/* Dynamic PSM for the L2CAP variant (BR/EDR PSMs must be odd, >= 0x1001). */
+#define AETHER_L2CAP_PSM  0x1001
+
 typedef struct RFCOMMTransport RFCOMMTransport;
 
 /* Server side (Laptop B — receiver) */
@@ -14,6 +17,14 @@ void             rfcomm_server_close(RFCOMMTransport *t);
 /* Client side (Laptop A — sender) */
 RFCOMMTransport* rfcomm_connect(const char *target_addr, uint8_t channel);
 void             rfcomm_client_close(RFCOMMTransport *t);
+
+/* L2CAP SOCK_SEQPACKET variant of the same transport: one AetherPacket per
+   L2CAP SDU, no RFCOMM framing or credit flow control in the path. Same
+   send/recv/close functions apply to the returned handle. Experimental: both
+   ends must use the same variant, and sustained-throughput gain over RFCOMM
+   is hardware-dependent — benchmark with `rfcomm_bench --l2cap` first. */
+RFCOMMTransport* l2cap_listen(uint16_t psm);
+RFCOMMTransport* l2cap_connect(const char *target_addr, uint16_t psm);
 
 /* Send/receive packets (blocking) */
 int  rfcomm_send_packet(RFCOMMTransport *t, const AetherPacket *pkt);

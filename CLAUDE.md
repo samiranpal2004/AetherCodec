@@ -57,12 +57,25 @@ Two static libs today: `aether_transport` (packet+RFCOMM, links `bluetooth`) and
 `aether_codec` (LPC+Rice+encoder/decoder, links `aether_transport` + `m`). New
 sources get added to the matching `src/CMakeLists.txt` target as each phase lands.
 
-**NL payload format** (self-describing, not fixed-size): `[frame_samples:u16]`
-then per channel `[order:u8][rice_k:u8][coeffs:order·i32][warmup:order·i32][rice_len:u16][rice_bytes]`.
+**NL payload format** (self-describing, not fixed-size): `[frame_samples:u16][flags:u8]`
+(flags bit0 = mid/side: `m=(l+r)>>1, s=l−r`, parity of `s` restores the lost bit)
+then per coded channel `[order:u8][rice_k:u8][wasted:u8][coeffs:order·i32][warmup:order·i32][rice_len:u16][rice_bytes]`
+— `wasted` = shared low zero bits shifted out pre-LPC, restored post-synthesis.
 
-**HQ payload format**: `[frame_samples:u16]` then per channel
-`[band_mask:u64][sf_rice_k:u8][sf_len:u16][sf_bytes][cf_rice_k:u8][cf_len:u16][cf_bytes]`
+**HQ payload format**: `[frame_samples:u16]` (total; 1–4 hops, multiple of
+`MDCT_HOP` — daemons batch `AETHER_HQ_HOPS_PER_PKT=4` to amortise the 24-byte
+header) then per hop `[flags:u8]` (bit0 = mid/side, applied to MDCT
+*coefficients* so the decoder's OLA history stays in L/R space) then per coded
+channel `[band_mask:u64][sf_rice_k:u8][sf_len:u16][sf_bytes][cf_rice_k:u8][cf_len:u16][cf_bytes]`
 — scalefactors and coefficients cover only the bands set in the mask.
+
+**Transport**: RFCOMM default; `--l2cap` on both daemons + `rfcomm_bench`
+selects L2CAP `SOCK_SEQPACKET` (PSM 0x1001, one packet per SDU) — experimental,
+benchmark per hardware pair. **Receiver → sender back-channel**: the receiver
+sends `CTRL_STATS_REPLY` (`AetherStatsReply`: loss, buffer, underruns) every
+~500 ms; the sender's reader thread must drain the socket in *every* mode (an
+unread reverse path eventually blocks the receiver), and ABR gets real loss for
+its 1/3/8% thresholds (stale > 2 s ⇒ treated as 0).
 
 ## Intentional divergences from the spec docs
 

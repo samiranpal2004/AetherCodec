@@ -8,6 +8,13 @@
 #define AETHER_ENCODER_MODE_NL  AETHER_MODE_NL
 #define AETHER_ENCODER_MODE_HQ  AETHER_MODE_HQ
 
+/* HQ frames (MDCT hops) carried per packet by the streaming daemons. One hop
+   per packet costs 187 packets/s at 96 kHz — ~36 kbps of header+CRC overhead,
+   which is 15%+ of a weak link. Four hops (2048 samples, matching NL's frame
+   duration) cut that 4x. The encoder accepts any multiple of MDCT_HOP up to
+   LPC_FRAME_SIZE per call; this is just the daemons' choice. */
+#define AETHER_HQ_HOPS_PER_PKT  4
+
 typedef struct AetherEncoder AetherEncoder;
 
 /* Create encoder.
