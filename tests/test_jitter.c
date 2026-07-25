@@ -94,6 +94,56 @@ int main(void) {
     jitter_buf_destroy(jb);
     printf("\xE2\x9C\x93 jitter: stale packet discarded\n");
 
+    /* --- sender restarts its sequence: must re-anchor, not wedge ----------
+       Regression: a sequence reset (sender restart, or an ABR switch back when
+       switching recreated the encoder) made every new packet look older than
+       next_seq, so the buffer discarded the entire rest of the stream and
+       playout froze until the counter climbed back past where it had been. */
+    jb = jitter_buf_create(40, 96000);
+    for (uint32_t s = 1000; s < 1010; s++) jitter_buf_insert(jb, mkpkt(s));
+    for (uint32_t s = 1000; s < 1010; s++) {
+        p = jitter_buf_pop(jb);
+        assert(p && payload_seq(p) == s);
+    }
+    assert(jitter_buf_resyncs(jb) == 0);
+
+    jitter_buf_insert(jb, mkpkt(0));             // sender counter restarted
+    jitter_buf_insert(jb, mkpkt(1));
+    assert(jitter_buf_resyncs(jb) == 1);
+    p = jitter_buf_pop(jb); assert(p && payload_seq(p) == 0);
+    p = jitter_buf_pop(jb); assert(p && payload_seq(p) == 1);
+    jitter_buf_destroy(jb);
+    printf("\xE2\x9C\x93 jitter: re-anchors after a sequence restart\n");
+
+    /* --- outage far past the reorder window also re-anchors ---------------
+       Walking next_seq forward one frame at a time would emit thousands of
+       concealment frames in a tight loop; re-anchor instead. */
+    jb = jitter_buf_create(40, 96000);
+    jitter_buf_insert(jb, mkpkt(0));
+    jitter_buf_insert(jb, mkpkt(1));
+    p = jitter_buf_pop(jb); assert(p && payload_seq(p) == 0);
+    jitter_buf_insert(jb, mkpkt(50000));         // huge forward jump
+    assert(jitter_buf_resyncs(jb) == 1);
+    jitter_buf_insert(jb, mkpkt(50001));
+    p = jitter_buf_pop(jb); assert(p && payload_seq(p) == 50000);
+    jitter_buf_destroy(jb);
+    printf("\xE2\x9C\x93 jitter: re-anchors after a long outage\n");
+
+    /* --- level_ms tracks the real frame geometry, not a hardcoded 2048 ---- */
+    jb = jitter_buf_create(40, 96000);
+    AetherPacket hq;
+    memset(&hq, 0, sizeof(hq));
+    hq.hdr.magic = AETHER_MAGIC; hq.hdr.mode = AETHER_MODE_HQ;
+    hq.hdr.channels = 2; hq.hdr.sample_rate = AETHER_RATE_96000;
+    hq.hdr.payload_size = 2;
+    uint16_t hop = 512; memcpy(hq.payload, &hop, 2);
+    for (uint32_t s = 0; s < 4; s++) { hq.hdr.sequence = s; jitter_buf_insert(jb, &hq); }
+    /* 4 HQ frames * 512 / 96000 = 21 ms, not the 85 ms a 2048-sample frame
+       would imply. */
+    assert(jitter_buf_level_ms(jb) == 21);
+    jitter_buf_destroy(jb);
+    printf("\xE2\x9C\x93 jitter: level_ms follows the stream's frame size\n");
+
     printf("\nAll jitter buffer tests passed.\n");
     return 0;
 }

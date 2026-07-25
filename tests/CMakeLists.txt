@@ -47,6 +47,11 @@ target_link_libraries(test_abr PRIVATE aether_runtime)
 target_compile_options(test_abr PRIVATE -UNDEBUG)
 add_test(NAME test_abr COMMAND test_abr)
 
+add_executable(test_abr_switch test_abr_switch.c)
+target_link_libraries(test_abr_switch PRIVATE aether_codec m)
+target_compile_options(test_abr_switch PRIVATE -UNDEBUG)
+add_test(NAME test_abr_switch COMMAND test_abr_switch)
+
 add_executable(test_resample test_resample.c)
 target_link_libraries(test_resample PRIVATE aether_runtime)
 target_compile_options(test_resample PRIVATE -UNDEBUG)

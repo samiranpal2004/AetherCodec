@@ -204,4 +204,15 @@ void aether_encoder_set_mode(AetherEncoder *enc, int new_mode) {
     memset(enc->hist, 0, sizeof(enc->hist));   // overlap state is mode-specific
 }
 
+void aether_encoder_reconfigure(AetherEncoder *enc, int mode, int sample_rate) {
+    if (!enc) return;
+    if (mode == enc->mode && sample_rate == enc->sample_rate) return;
+    enc->mode        = mode;
+    enc->sample_rate = sample_rate;
+    /* Overlap history is both mode- and rate-specific; the sequence counter
+       deliberately survives (see the header comment). */
+    memset(enc->hist, 0, sizeof(enc->hist));
+    mdct_init(sample_rate);   // rebuilds the rate-dependent Bark/ATH tables
+}
+
 void aether_encoder_destroy(AetherEncoder *enc) { free(enc); }

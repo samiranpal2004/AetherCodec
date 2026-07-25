@@ -27,6 +27,7 @@ struct PwPlay {
     int                    channels;
     unsigned long          underruns;
     int                    primed;         /* prebuffer cushion reached? */
+    int                    started;        /* has playout ever begun? */
     uint32_t               target_frames;  /* cushion before playout starts */
 };
 
@@ -56,22 +57,34 @@ static void play_on_process(void *userdata) {
        RFCOMM delivery and small A/B clock drift don't bounce the ring off
        empty. If we ever drain completely, re-prime rather than trickle. */
     if (!p->primed &&
-        audio_ring_available(p->ring) >= p->target_frames * (uint32_t)p->channels)
-        p->primed = 1;
+        audio_ring_available(p->ring) >= p->target_frames * (uint32_t)p->channels) {
+        p->primed  = 1;
+        p->started = 1;
+    }
 
     uint32_t nvals = want * (uint32_t)p->channels;
     int32_t *dst = (int32_t *)d->data;
 
+    /* All-or-nothing: only drain when a whole quantum is available. Taking a
+       partial read instead (the previous behaviour, which only re-primed on a
+       *fully* empty ring) leaves the ring hovering near empty and hands the DAC
+       a stream of half-filled buffers — continuous crackle rather than one
+       clean gap followed by a rebuilt cushion. */
     uint32_t got = 0;
     if (p->primed) {
-        got = audio_ring_read(p->ring, dst, nvals);
-        if (got == 0) p->primed = 0;       /* fully starved — rebuild cushion */
+        if (audio_ring_available(p->ring) >= nvals)
+            got = audio_ring_read(p->ring, dst, nvals);
+        else
+            p->primed = 0;                 /* starved — rebuild the cushion */
     }
     for (uint32_t i = 0; i < got; i++)
         dst[i] <<= 8;                      /* 24-bit range -> S32 */
     if (got < nvals) {
         memset(dst + got, 0, (nvals - got) * sizeof(int32_t));
-        if (p->primed) p->underruns += (nvals - got) / (uint32_t)p->channels;
+        /* Silence before the very first prime is expected start-up latency, not
+           an underrun. Silence after that — including a re-prime's cushion — is
+           audio the listener should have heard, so count all of it. */
+        if (p->started) p->underruns += (nvals - got) / (uint32_t)p->channels;
     }
 
     d->chunk->offset = 0;
