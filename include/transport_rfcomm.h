@@ -8,6 +8,9 @@
 /* Dynamic PSM for the L2CAP variant (BR/EDR PSMs must be odd, >= 0x1001). */
 #define AETHER_L2CAP_PSM  0x1001
 
+/* Default listen/connect port for the TCP variant. */
+#define AETHER_TCP_PORT   7331
+
 typedef struct RFCOMMTransport RFCOMMTransport;
 
 /* Server side (Laptop B — receiver) */
@@ -25,6 +28,20 @@ void             rfcomm_client_close(RFCOMMTransport *t);
    is hardware-dependent — benchmark with `rfcomm_bench --l2cap` first. */
 RFCOMMTransport* l2cap_listen(uint16_t psm);
 RFCOMMTransport* l2cap_connect(const char *target_addr, uint16_t psm);
+
+/* TCP variant (Wi-Fi instead of Bluetooth). A reliable ordered byte stream like
+   RFCOMM, so it uses the *identical* header-then-payload framing — same wire
+   bytes, no format change. Exists because Bluetooth Classic cannot carry
+   hi-res lossless: NL-96k needs ~2-3 Mbps on real music against a measured
+   ~200 kbps RFCOMM link. Same send/recv/close functions apply. */
+RFCOMMTransport* tcp_listen(uint16_t port);
+RFCOMMTransport* tcp_connect(const char *host, uint16_t port);
+
+/* Parse "IP" or "IP:PORT" from a --target argument. *port_out keeps its
+   incoming value (the caller's default) when no ":PORT" is given.
+   Returns 0 on success, -1 on a malformed target. */
+int tcp_parse_target(const char *target, char *host_out, size_t host_size,
+                     uint16_t *port_out);
 
 /* Send/receive packets (blocking) */
 int  rfcomm_send_packet(RFCOMMTransport *t, const AetherPacket *pkt);

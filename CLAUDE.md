@@ -71,7 +71,17 @@ channel `[band_mask:u64][sf_rice_k:u8][sf_len:u16][sf_bytes][cf_rice_k:u8][cf_le
 
 **Transport**: RFCOMM default; `--l2cap` on both daemons + `rfcomm_bench`
 selects L2CAP `SOCK_SEQPACKET` (PSM 0x1001, one packet per SDU) — experimental,
-benchmark per hardware pair. **Receiver → sender back-channel**: the receiver
+benchmark per hardware pair. **`--tcp` streams over Wi-Fi instead** (port 7331,
+`--target IP[:PORT]`, receiver `--port N`): Bluetooth Classic cannot carry
+hi-res lossless — measured NL-96k needs ~3.2 Mbps against a ~200 kbps RFCOMM
+link — so TCP is what actually makes NL/HQ smooth. Same wire bytes and same
+framing loop as RFCOMM (`seqpacket=0`); only the constructors differ, all three
+share `rfcomm_send_packet`/`rfcomm_recv_packet` and the handle in the private
+`src/transport/transport_internal.h`. `--tcp` and `--l2cap` are mutually
+exclusive. On `--tcp` the sender **must not** poll RSSI (no HCI link) and must
+**skip `abr_start_at()`** — that call makes the start rung a ceiling relaxing
+one rung per 20 s, which would pin `auto` low on a link that carries NL-96k
+fine. **Receiver → sender back-channel**: the receiver
 sends `CTRL_STATS_REPLY` (`AetherStatsReply`: loss, buffer, underruns) every
 ~500 ms; the sender's reader thread must drain the socket in *every* mode (an
 unread reverse path eventually blocks the receiver), and ABR gets real loss for

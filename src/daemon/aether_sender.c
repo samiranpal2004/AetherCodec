@@ -276,6 +276,7 @@ struct abr_thread_args {
     int         demo;
     int         loopback;
     int         verbose;
+    int         tcp;     /* no HCI link to read RSSI from */
 };
 
 static void *abr_thread(void *arg) {
@@ -294,6 +295,14 @@ static void *abr_thread(void *arg) {
             if (demo_rssi <= -95) demo_dir =  1;
             if (demo_rssi >= -50) demo_dir = -1;
             rssi = demo_rssi;
+        } else if (a->tcp) {
+            /* No Bluetooth link exists, so there is no RSSI to read — polling
+               it would just fail every 500 ms against an IP address. Feed a
+               strong neutral value and let the real signals decide: receiver-
+               reported loss (which works fine over TCP) and send-queue
+               backpressure. On a clean LAN both are quiet, so `auto` correctly
+               sits at the top rung. */
+            rssi = -40;
         } else if (bt_read_rssi(a->target, &rssi) < 0) {
             if (!warned) {
                 fprintf(stderr, "[abr] cannot read RSSI (needs an active link and "
@@ -324,16 +333,21 @@ static void *abr_thread(void *arg) {
                              aether_timestamp_us() / 1000ULL);
         ABRState after = abr_current_state(g_abr);
 
+        /* On TCP there is no RSSI, so report what actually drove the decision. */
+        char link_desc[48];
+        if (a->tcp) snprintf(link_desc, sizeof(link_desc), "loss=%.1f%%", loss);
+        else        snprintf(link_desc, sizeof(link_desc), "RSSI=%d dBm", rssi);
+
         if (after != before) {
             g_abr_state_scratch = (int)after;
             atomic_store(&pending_state, (int)after);
-            printf("[abr] %s -> %s (RSSI=%d dBm%s)\n",
-                   abr_state_name(before), abr_state_name(after), rssi,
+            printf("[abr] %s -> %s (%s%s)\n",
+                   abr_state_name(before), abr_state_name(after), link_desc,
                    congested ? ", congested" : "");
             fflush(stdout);
         } else if (a->verbose) {
-            printf("[abr] holding %s (RSSI=%d dBm%s)\n",
-                   abr_state_name(after), rssi, congested ? ", congested" : "");
+            printf("[abr] holding %s (%s%s)\n",
+                   abr_state_name(after), link_desc, congested ? ", congested" : "");
             fflush(stdout);
         }
     }
@@ -344,23 +358,27 @@ static void *abr_thread(void *arg) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "Usage: %s --target BT_ADDR [--mode nl|hq|auto] [--l2cap] [--verbose]\n"
-        "       %s --loopback       [--mode nl|hq|auto] [--verbose] [--no-play]\n"
+        "Usage: %s --target BT_ADDR|IP[:PORT] [--mode nl|hq|auto]\n"
+        "                        [--l2cap | --tcp] [--verbose]\n"
+        "       %s --loopback    [--mode nl|hq|auto] [--verbose] [--no-play]\n"
         "\n"
         "  --mode auto  adaptive bitrate: RSSI/loss + send-queue backpressure\n"
+        "  --tcp        stream over TCP/Wi-Fi instead of Bluetooth; --target is\n"
+        "               then an IPv4 address (default port %d). Bluetooth cannot\n"
+        "               carry hi-res lossless; TCP can. Receiver needs --tcp too.\n"
         "  --l2cap      use L2CAP SOCK_SEQPACKET instead of RFCOMM (experimental;\n"
         "               receiver must also run with --l2cap)\n"
         "  --abr-demo   with --mode auto, sweep a simulated RSSI (single machine)\n"
         "  --no-play    loopback without a playback stream (avoids feeding our own\n"
         "               default sink back into itself on a machine with no real\n"
         "               audio output)\n",
-        argv0, argv0);
+        argv0, argv0, AETHER_TCP_PORT);
 }
 
 int main(int argc, char *argv[]) {
     const char *target = NULL;
     int mode = AETHER_MODE_NL, loopback = 0, verbose = 0, no_play = 0;
-    int auto_mode = 0, abr_demo = 0, use_l2cap = 0;
+    int auto_mode = 0, abr_demo = 0, use_l2cap = 0, use_tcp = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--target") && i + 1 < argc)      target = argv[++i];
@@ -368,6 +386,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--no-play"))                no_play = 1;
         else if (!strcmp(argv[i], "--abr-demo"))               abr_demo = 1;
         else if (!strcmp(argv[i], "--l2cap"))                  use_l2cap = 1;
+        else if (!strcmp(argv[i], "--tcp"))                    use_tcp = 1;
         else if (!strcmp(argv[i], "--verbose"))                verbose = 1;
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char *m = argv[++i];
@@ -378,11 +397,26 @@ int main(int argc, char *argv[]) {
         } else { usage(argv[0]); return 1; }
     }
     if (!target && !loopback) { usage(argv[0]); return 1; }
+    if (use_tcp && use_l2cap) {
+        fprintf(stderr, "--tcp and --l2cap are mutually exclusive\n");
+        return 1;
+    }
 
-    /* auto over a real link starts at HQ-96k (see abr_start_at below); in
+    /* --tcp: --target is "IP" or "IP:PORT". */
+    char     tcp_host[64] = {0};
+    uint16_t tcp_port     = AETHER_TCP_PORT;
+    if (use_tcp && target &&
+        tcp_parse_target(target, tcp_host, sizeof(tcp_host), &tcp_port) < 0) {
+        fprintf(stderr, "[sender] bad --target '%s' (want IP or IP:PORT)\n", target);
+        return 1;
+    }
+
+    /* auto over a real BT link starts at HQ-96k (see abr_start_at below); in
        loopback there is no link to flood, and --abr-demo needs the ladder's
-       top so the sweep can exercise the full range. */
-    if (auto_mode && !loopback) mode = AETHER_MODE_HQ;
+       top so the sweep can exercise the full range. TCP also keeps the
+       optimistic start — Wi-Fi carries NL-96k comfortably, and starting low
+       there would pin the ladder for ~20 s per rung for no reason. */
+    if (auto_mode && !loopback && !use_tcp) mode = AETHER_MODE_HQ;
 
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
@@ -403,10 +437,12 @@ int main(int argc, char *argv[]) {
     int send_running = 0, stats_running = 0;
     struct send_args sa;
     if (!loopback) {
-        t = use_l2cap ? l2cap_connect(target, AETHER_L2CAP_PSM)
+        t = use_tcp   ? tcp_connect(tcp_host, tcp_port)
+          : use_l2cap ? l2cap_connect(target, AETHER_L2CAP_PSM)
                       : rfcomm_connect(target, RFCOMM_CHANNEL);
         if (!t) { fprintf(stderr, "[sender] %s connect failed\n",
-                          use_l2cap ? "L2CAP" : "RFCOMM"); return 1; }
+                          use_tcp ? "TCP" : use_l2cap ? "L2CAP" : "RFCOMM");
+                  return 1; }
         if (sendq_init(&g_sendq)) { fprintf(stderr, "sendq alloc failed\n"); return 1; }
         sa.t = t;
         if (pthread_create(&send_tid, NULL, send_thread, &sa) == 0)
@@ -440,7 +476,7 @@ int main(int argc, char *argv[]) {
     }
 
     pthread_t abr_tid;
-    struct abr_thread_args aargs = { target, abr_demo, loopback, verbose };
+    struct abr_thread_args aargs = { target, abr_demo, loopback, verbose, use_tcp };
     int abr_running = 0;
     if (auto_mode) {
         g_abr = abr_ctrl_create(abr_on_switch, &g_abr_state_scratch);
@@ -452,8 +488,16 @@ int main(int argc, char *argv[]) {
            first few seconds, every time. Start at HQ-96k (fits any EDR link
            at the default SMR) and let the headroom-gated probe path earn the
            NL rungs if the link really has the capacity. Loopback keeps the
-           optimistic start: no real link, and --abr-demo sweeps the ladder. */
-        if (g_abr && !loopback)
+           optimistic start: no real link, and --abr-demo sweeps the ladder.
+
+           TCP also keeps it. abr_start_at() makes the start rung a *ceiling*
+           that only relaxes one rung per ABR_PROBE_INTERVAL_MS, so applying it
+           to a multi-Mbps Wi-Fi link would hold `auto` at HQ-96k for ~20 s per
+           rung purely because the Bluetooth path needed that guard. The
+           default state is already NL-96k with no ceiling, which is right
+           here: the link genuinely carries it, and congestion/loss will still
+           step it down if that turns out to be wrong. */
+        if (g_abr && !loopback && !use_tcp)
             abr_start_at(g_abr, ABR_STATE_HQ_96K,
                          aether_timestamp_us() / 1000ULL);
         if (g_abr && pthread_create(&abr_tid, NULL, abr_thread, &aargs) == 0)
@@ -462,7 +506,8 @@ int main(int argc, char *argv[]) {
 
     printf("[sender] mode=%s %s\n",
            auto_mode ? "AUTO (ABR)" : (mode == AETHER_MODE_NL ? "NL" : "HQ"),
-           loopback ? "(loopback — no Bluetooth)" : "");
+           loopback ? "(loopback — no Bluetooth)"
+                    : use_tcp ? "(TCP/Wi-Fi)" : use_l2cap ? "(L2CAP)" : "(RFCOMM)");
     if (auto_mode && abr_demo)
         printf("[sender] ABR demo: sweeping a simulated RSSI\n");
     printf("[sender] Sink registered as \"AetherCodec Hi-Res BT\".\n");
