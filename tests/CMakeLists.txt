@@ -41,3 +41,13 @@ add_executable(test_jitter test_jitter.c)
 target_link_libraries(test_jitter PRIVATE aether_runtime)
 target_compile_options(test_jitter PRIVATE -UNDEBUG)
 add_test(NAME test_jitter COMMAND test_jitter)
+
+add_executable(test_abr test_abr.c)
+target_link_libraries(test_abr PRIVATE aether_runtime)
+target_compile_options(test_abr PRIVATE -UNDEBUG)
+add_test(NAME test_abr COMMAND test_abr)
+
+add_executable(test_resample test_resample.c)
+target_link_libraries(test_resample PRIVATE aether_runtime)
+target_compile_options(test_resample PRIVATE -UNDEBUG)
+add_test(NAME test_resample COMMAND test_resample)
