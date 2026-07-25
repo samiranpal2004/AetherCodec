@@ -695,6 +695,8 @@ into the comparison table in `docs/AetherCodec_IMPLEMENTATION.md` §6.4.
 | Streaming works but audio comes out of **A's** speakers | forgot `--target aether_codec_sink` on `pw-play` | Our sink has priority −1, so A's real output stays default; always target the sink |
 | B decodes garbage / loud noise | mismatched builds on A and B | Rebuild both from the same commit (no wire-format versioning) |
 | Two-machine `garbled after a while`, `underruns` climbing | link below the codec's bitrate | Check §9.2 throughput; use `--mode auto` or `hq` |
+| Stutter with **`lost=0` but huge `underruns`** (≫ playtime) | playback over-drained the ring (fixed) | Rebuild — playback now pins one quantum + prebuffers ~100 ms. `underruns` far exceeding total samples played meant the buffer was pulled several× realtime |
+| Rare click every few minutes, otherwise smooth | A/B sample-clock drift | Expected for now — no async resampler; the ~100 ms prebuffer re-primes on a full drain |
 
 ---
 

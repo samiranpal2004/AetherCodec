@@ -3,10 +3,21 @@
 #include "pw_io.h"
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
+#include <spa/param/param.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 void aether_pw_init_once(void);   /* defined in pw_sink.c */
+
+/* Frames per graph cycle we ask PipeWire to run (≈10.7 ms at 96 kHz). We force
+   this both as the node latency AND as the buffer size, so d->maxsize equals
+   exactly one quantum. Without that, PipeWire allocates maxsize for its
+   *maximum* quantum (often 8192) while running a smaller one, and filling
+   maxsize each callback over-drains the ring several-fold — the buffer then
+   sits empty and playback stutters (observed: ~4x over-drain on 0.3.48, which
+   has no pw_buffer.requested to tell us the real amount). */
+#define PLAY_QUANTUM 1024
 
 struct PwPlay {
     struct pw_thread_loop *loop;
@@ -15,6 +26,8 @@ struct PwPlay {
     AudioRing             *ring;
     int                    channels;
     unsigned long          underruns;
+    int                    primed;         /* prebuffer cushion reached? */
+    uint32_t               target_frames;  /* cushion before playout starts */
 };
 
 static void play_on_process(void *userdata) {
@@ -27,22 +40,38 @@ static void play_on_process(void *userdata) {
 
     uint32_t stride    = sizeof(int32_t) * (uint32_t)p->channels;
     uint32_t maxframes = d->maxsize / stride;
-#if PW_CHECK_VERSION(0, 3, 49)
-    /* pw_buffer.requested only exists from 0.3.49; before that we simply fill
-       the whole buffer, which is the behaviour those versions expect. */
-    if (b->requested && b->requested < maxframes)
-        maxframes = (uint32_t)b->requested;
-#endif
 
-    uint32_t nvals = maxframes * (uint32_t)p->channels;
+    /* Produce exactly one quantum, never the whole buffer. Prefer the size
+       PipeWire actually asks for (0.3.49+); otherwise our forced buffer size
+       makes maxframes == PLAY_QUANTUM, but clamp anyway so a version that
+       ignores the request can never make us over-drain. */
+    uint32_t want = maxframes;
+#if PW_CHECK_VERSION(0, 3, 49)
+    if (b->requested) want = (uint32_t)b->requested;
+#endif
+    if (want > maxframes)    want = maxframes;
+    if (want > PLAY_QUANTUM) want = PLAY_QUANTUM;
+
+    /* Prebuffer: don't start draining until a cushion has built up, so bursty
+       RFCOMM delivery and small A/B clock drift don't bounce the ring off
+       empty. If we ever drain completely, re-prime rather than trickle. */
+    if (!p->primed &&
+        audio_ring_available(p->ring) >= p->target_frames * (uint32_t)p->channels)
+        p->primed = 1;
+
+    uint32_t nvals = want * (uint32_t)p->channels;
     int32_t *dst = (int32_t *)d->data;
 
-    uint32_t got = audio_ring_read(p->ring, dst, nvals);
+    uint32_t got = 0;
+    if (p->primed) {
+        got = audio_ring_read(p->ring, dst, nvals);
+        if (got == 0) p->primed = 0;       /* fully starved — rebuild cushion */
+    }
     for (uint32_t i = 0; i < got; i++)
         dst[i] <<= 8;                      /* 24-bit range -> S32 */
     if (got < nvals) {
         memset(dst + got, 0, (nvals - got) * sizeof(int32_t));
-        p->underruns += (nvals - got) / (uint32_t)p->channels;
+        if (p->primed) p->underruns += (nvals - got) / (uint32_t)p->channels;
     }
 
     d->chunk->offset = 0;
@@ -64,17 +93,22 @@ PwPlay* pw_play_start(const char *name, int rate, int channels, AudioRing *ring)
     if (!p) return NULL;
     p->ring     = ring;
     p->channels = channels;
+    /* ~100 ms cushion before playout starts (a handful of NL frames). */
+    p->target_frames = (uint32_t)rate / 10;
 
     p->loop = pw_thread_loop_new("aether-play", NULL);
     if (!p->loop) { free(p); return NULL; }
 
     pw_thread_loop_lock(p->loop);
 
+    char latency[32];
+    snprintf(latency, sizeof(latency), "%d/%d", PLAY_QUANTUM, rate);
     struct pw_properties *props = pw_properties_new(
         PW_KEY_MEDIA_TYPE,     "Audio",
         PW_KEY_MEDIA_CATEGORY, "Playback",
         PW_KEY_MEDIA_ROLE,     "Music",
         PW_KEY_NODE_NAME,      name,
+        PW_KEY_NODE_LATENCY,   latency,   /* ask the graph to run this quantum */
         NULL);
 
     p->stream = pw_stream_new_simple(pw_thread_loop_get_loop(p->loop),
@@ -88,7 +122,7 @@ PwPlay* pw_play_start(const char *name, int rate, int channels, AudioRing *ring)
 
     uint8_t buffer[1024];
     struct spa_pod_builder pb = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-    const struct spa_pod *params[1];
+    const struct spa_pod *params[2];
     struct spa_audio_info_raw info = {
         .format   = SPA_AUDIO_FORMAT_S32,
         .channels = (uint32_t)channels,
@@ -96,11 +130,22 @@ PwPlay* pw_play_start(const char *name, int rate, int channels, AudioRing *ring)
     };
     params[0] = spa_format_audio_raw_build(&pb, SPA_PARAM_EnumFormat, &info);
 
+    /* Pin the buffer to exactly one quantum so d->maxsize == PLAY_QUANTUM
+       frames — this is what stops the over-drain on PipeWire builds that lack
+       pw_buffer.requested. */
+    uint32_t stride = sizeof(int32_t) * (uint32_t)channels;
+    params[1] = spa_pod_builder_add_object(&pb,
+        SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+        SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(3, 2, 8),
+        SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
+        SPA_PARAM_BUFFERS_size,    SPA_POD_Int((int)(PLAY_QUANTUM * stride)),
+        SPA_PARAM_BUFFERS_stride,  SPA_POD_Int((int)stride));
+
     if (pw_stream_connect(p->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
                           PW_STREAM_FLAG_AUTOCONNECT |
                           PW_STREAM_FLAG_MAP_BUFFERS |
                           PW_STREAM_FLAG_RT_PROCESS,
-                          params, 1) < 0) {
+                          params, 2) < 0) {
         pw_stream_destroy(p->stream);
         pw_thread_loop_unlock(p->loop);
         pw_thread_loop_destroy(p->loop);
