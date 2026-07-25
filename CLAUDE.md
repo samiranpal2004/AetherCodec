@@ -101,6 +101,18 @@ don't "fix" them back to match the prose:
 - Mode/rate switches need no control packet: every header carries `mode` +
   `sample_rate` and the decoder flushes on change (survives packet loss, unlike
   a one-shot `CTRL_CODEC_CHANGE`).
+- **Sender decouples encode from send** (bounded packet queue + send thread):
+  `rfcomm_send_packet` blocks, and blocking the encode loop on big NL frames
+  drops captured audio and makes delivery bursty (stutter). Don't reintroduce a
+  direct send from the encode loop.
+- **ABR also reacts to send-queue backpressure**, not just RSSI (`abr_update_congested`):
+  a strong link can still be unable to carry NL-96k. Congestion drops a rung
+  immediately and holds a ceiling for `ABR_PROBE_INTERVAL_MS` to avoid oscillation.
+- **Receiver playback: fill one quantum, never `maxsize`.** PipeWire sizes
+  `maxsize` for its max quantum; filling it over-drains the ring several-fold
+  (huge `underruns` with `lost=0`). Pin the buffer via `SPA_PARAM_Buffers` +
+  `NODE_LATENCY`; `pw_buffer.requested` is absent before 0.3.49. Playback also
+  prebuffers ~250 ms to absorb Bluetooth bursts.
 - NL-48K is lossless only *relative to the decimated signal*; 96→48 itself is
   lossy. Don't claim end-to-end bit-exactness for the 48k states.
 
