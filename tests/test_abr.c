@@ -159,6 +159,59 @@ int main(void) {
     printf("\xE2\x9C\x93 abr: headroom restored -> climbs back to best quality\n");
     abr_ctrl_destroy(a);
 
+    /* --- abr_start_at: the start rung is also the initial ceiling ---------
+       `auto` starts at HQ-96k (NL-96k needs ~3 Mbps on real music — no RFCOMM
+       link carries that, so the optimistic start flooded the queue every
+       session). Strong RSSI alone must NOT jump the ladder above the start
+       rung; that has to be earned through the headroom-gated probe. */
+    a = abr_ctrl_create(NULL, NULL);
+    t = 0;
+    abr_start_at(a, ABR_STATE_HQ_96K, t);
+    assert(abr_current_state(a) == ABR_STATE_HQ_96K);
+    for (int i = 0; i < 20; i++) {   /* RSSI classifies NL-96k the whole time */
+        abr_update_congested(a, -50, 0.0f, 0, t); t += TICK_MS;
+    }
+    assert(abr_current_state(a) == ABR_STATE_HQ_96K);
+    /* Congestion still downgrades immediately from the start rung. */
+    abr_update_congested(a, -50, 0.0f, 1, t); t += TICK_MS;
+    assert(abr_current_state(a) == ABR_STATE_HQ_48K);
+    printf("\xE2\x9C\x93 abr: start-at holds the start rung against strong RSSI, "
+           "still downgrades on congestion\n");
+    abr_ctrl_destroy(a);
+
+    /* With real headroom the ceiling relaxes one rung per probe interval, so a
+       link that genuinely has spare capacity can still reach the NL rungs. */
+    a = abr_ctrl_create(NULL, NULL);
+    t = 0;
+    abr_start_at(a, ABR_STATE_HQ_96K, t);
+    abr_set_headroom(a, 1);
+    t += ABR_PROBE_INTERVAL_MS;
+    for (int i = 0; i < 10; i++) { abr_update_congested(a, -50, 0.0f, 0, t); t += TICK_MS; }
+    assert(abr_current_state(a) == ABR_STATE_NL_48K);
+    printf("\xE2\x9C\x93 abr: start-at + proven headroom climbs one rung per "
+           "probe interval\n");
+    abr_ctrl_destroy(a);
+
+    /* --- SMR recovery is fast while the queue is idle ---------------------
+       After a congestion cut the controller used to crawl back at 0.4 dB per
+       tick (~26 s from the floor to the ceiling) even with a bone-dry queue.
+       The idle fast tier must recover in well under half that. */
+    {
+        float smr = ABR_SMR_MIN_DB;
+        int ticks = 0;
+        while (smr < ABR_SMR_MAX_DB && ticks < 1000) {
+            smr = abr_smr_step(smr, 0, 0);   /* queue empty, nothing dropped */
+            ticks++;
+        }
+        int max_ticks = (int)((ABR_SMR_MAX_DB - ABR_SMR_MIN_DB)
+                              / ABR_SMR_UP_FAST_DB) + 1;
+        assert(ticks <= max_ticks);
+        printf("\xE2\x9C\x93 abr: idle-queue SMR recovery %g -> %g dB in %d ticks "
+               "(%.1f s at 250 ms)\n",
+               (double)ABR_SMR_MIN_DB, (double)ABR_SMR_MAX_DB,
+               ticks, ticks * 0.25);
+    }
+
     /* --- HQ rate controller converges ------------------------------------
        Simulate a link with a fixed capacity and let the AIMD loop find it. The
        model: bitrate rises ~25 kbps per dB of SMR, anything over capacity

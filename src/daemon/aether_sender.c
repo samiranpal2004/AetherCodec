@@ -83,7 +83,11 @@ typedef struct {
     int             head, tail, count;
     float           queued_ms;
     int             closed;
-    unsigned long   dropped;
+    unsigned long   dropped;      /* overflow drops — the congestion signal   */
+    unsigned long   flushed;      /* discarded on an ABR switch — NOT counted
+                                     as congestion, or every flush would read
+                                     as fresh backpressure and cascade the
+                                     ladder down another rung */
     pthread_mutex_t mtx;
     pthread_cond_t  cv;
 } SendQueue;
@@ -168,6 +172,30 @@ static unsigned long sendq_dropped(SendQueue *q) {
     unsigned long d = q->dropped;
     pthread_mutex_unlock(&q->mtx);
     return d;
+}
+
+/* Everything the receiver will see as a sequence gap (its `lost` counter). */
+static unsigned long sendq_dropped_total(SendQueue *q) {
+    pthread_mutex_lock(&q->mtx);
+    unsigned long d = q->dropped + q->flushed;
+    pthread_mutex_unlock(&q->mtx);
+    return d;
+}
+
+/* Discard everything queued. Called when ABR commits to a new operating point:
+   the backlog is audio the old mode over-produced, already ~SENDQ_MAX_MS late.
+   Draining it through the link first (a) delays the new mode's packets by up to
+   half a second and (b) keeps the queue-depth signal pinned high, which the
+   controller reads as the NEW mode also failing — that false signal is what
+   cascaded auto from NL-96k all the way to HQ-48k/SMR-12 in the first second of
+   the 2026-07-25 run. The receiver conceals the gap and re-anchors. */
+static void sendq_flush(SendQueue *q) {
+    pthread_mutex_lock(&q->mtx);
+    q->flushed  += (unsigned long)q->count;
+    q->tail      = q->head;
+    q->count     = 0;
+    q->queued_ms = 0.0f;
+    pthread_mutex_unlock(&q->mtx);
 }
 
 static void sendq_free(SendQueue *q) {
@@ -304,6 +332,11 @@ int main(int argc, char *argv[]) {
     }
     if (!target && !loopback) { usage(argv[0]); return 1; }
 
+    /* auto over a real link starts at HQ-96k (see abr_start_at below); in
+       loopback there is no link to flood, and --abr-demo needs the ladder's
+       top so the sweep can exercise the full range. */
+    if (auto_mode && !loopback) mode = AETHER_MODE_HQ;
+
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
 
@@ -357,6 +390,18 @@ int main(int argc, char *argv[]) {
     int abr_running = 0;
     if (auto_mode) {
         g_abr = abr_ctrl_create(abr_on_switch, &g_abr_state_scratch);
+        /* Divergence from the HLD's "start optimistic" NL-96k start: measured
+           NL-96k needs ~3 Mbps on real music (LPC gets ~1.5x on 24-bit
+           masters), which no RFCOMM link carries. Starting there flooded the
+           send queue and cascaded congestion downgrades to HQ-48k/SMR-12
+           within the first second of every session — audible as a broken
+           first few seconds, every time. Start at HQ-96k (fits any EDR link
+           at the default SMR) and let the headroom-gated probe path earn the
+           NL rungs if the link really has the capacity. Loopback keeps the
+           optimistic start: no real link, and --abr-demo sweeps the ladder. */
+        if (g_abr && !loopback)
+            abr_start_at(g_abr, ABR_STATE_HQ_96K,
+                         aether_timestamp_us() / 1000ULL);
         if (g_abr && pthread_create(&abr_tid, NULL, abr_thread, &aargs) == 0)
             abr_running = 1;
     }
@@ -408,6 +453,10 @@ int main(int argc, char *argv[]) {
                 resample_reset(&down);
                 resample_reset(&up);
                 if (dec) aether_decoder_flush(dec);
+                /* The old mode's backlog must not be dragged into the new
+                   operating point — see sendq_flush. On an upgrade the queue
+                   is near-empty anyway, so flushing unconditionally is fine. */
+                if (!loopback) sendq_flush(&g_sendq);
                 seg_frames = 0; seg_bytes = 0;
                 seg_start_us = aether_timestamp_us();
             }
@@ -500,12 +549,12 @@ int main(int argc, char *argv[]) {
                 printf("[stats] frames=%lu  %.1fs  %.0f kbps  mode=HQ rate=%d  "
                        "smr=%.0fdB link=%.0f kbps  queue=%dms dropped=%lu\n",
                        frames, wall_s, kbps, rate, mdct_get_smr_db(), link_kbps,
-                       sendq_depth_ms(&g_sendq), sendq_dropped(&g_sendq));
+                       sendq_depth_ms(&g_sendq), sendq_dropped_total(&g_sendq));
             else
                 printf("[stats] frames=%lu  %.1fs  %.0f kbps  mode=NL rate=%d  "
                        "link=%.0f kbps  queue=%dms dropped=%lu\n",
                        frames, wall_s, kbps, rate, link_kbps,
-                       sendq_depth_ms(&g_sendq), sendq_dropped(&g_sendq));
+                       sendq_depth_ms(&g_sendq), sendq_dropped_total(&g_sendq));
             fflush(stdout);
 
             /* A fixed mode that keeps dropping is simply over the link's

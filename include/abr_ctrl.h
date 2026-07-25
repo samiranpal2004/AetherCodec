@@ -51,7 +51,21 @@ typedef enum {
 #define ABR_QUEUE_LOW_MS    40   /* below this there is room to spend more bits */
 #define ABR_QUEUE_HIGH_MS   90   /* above this we are already behind            */
 #define ABR_SMR_UP_DB      0.4f  /* additive increase — deliberately gentle     */
-#define ABR_SMR_MAX_DB    30.0f
+/* When the queue is essentially empty the link is demonstrably not the
+   constraint, so climb faster. This matters after a congestion cut: at 0.4 dB
+   per 250 ms tick, recovering from 12 dB took ~26 s of audibly degraded
+   quality; the fast tier brings that under 10 s while still falling back to
+   the gentle step as soon as the queue shows any depth. */
+#define ABR_SMR_IDLE_MS     10   /* queue at/below this = link clearly idle     */
+#define ABR_SMR_UP_FAST_DB 1.2f
+/* Ceiling raised from 30 dB (2026-07-25 run three): at 30 dB HQ-96k settled at
+   ~480 kbps against a measured ~900 kbps link — the controller was pinned at
+   max with half the link unused, which is exactly the "HQ sounds average"
+   report. 54 dB ≈ +4 bits per significant coefficient (~+280 kbps broadband at
+   96 kHz), enough that on any realistic RFCOMM link the QUEUE, not this
+   constant, is what stops the climb. Audible SNR tracks SMR ~1:1 above the
+   floor, so a link with spare capacity now buys real quality with it. */
+#define ABR_SMR_MAX_DB    54.0f
 /* The codec allows down to 6 dB, but measured audible SNR there is ~2 dB —
    noise, and worse than the dropouts it would be avoiding. 12 dB (~12 dB SNR)
    is the floor worth having. Below it the right move is not to keep crushing
@@ -97,6 +111,16 @@ void abr_update_congested(ABRCtrl *abr, int rssi_dbm, float packet_loss_pct,
    settles on a mode that fits instead of re-probing an impossible one on a
    timer forever. Defaults to 1 (plain timer relax) if never called. */
 void abr_set_headroom(ABRCtrl *abr, int headroom);
+
+/* Start (or restart) the ladder at a specific rung. Sets both the current
+   state and the congestion ceiling, so everything better than `state` must be
+   earned via the headroom-gated relax path rather than granted on the first
+   strong RSSI reading. The sender uses this to start `auto` at HQ-96k: the
+   PRD's "start optimistic" NL-96k start needs ~3 Mbps on real music, which no
+   RFCOMM link carries, so starting there guaranteed a ~500 ms queue flood, a
+   cascade of congestion downgrades and several seconds of glitching at the
+   top of every session. */
+void abr_start_at(ABRCtrl *abr, ABRState state, uint64_t now_ms);
 
 /* Pure classification of a link condition — no hysteresis, no state. */
 ABRState abr_classify(int rssi_dbm, float packet_loss_pct);

@@ -28,10 +28,16 @@
    cannot carry what the content happens to need, the sender's queue backs up
    and frames get dropped, which is far more audible than the coarser
    quantisation that would have avoided it. The sender closes the loop on this
-   (see aether_sender.c). Process-global like the rest of this module's tables. */
+   (see aether_sender.c). Process-global like the rest of this module's tables.
+
+   The codec-level ceiling is 60 dB (~10 bits per significant coefficient);
+   the operational ceiling lives in the rate controller (ABR_SMR_MAX_DB). It
+   used to be 30 dB here too, which silently capped HQ at ~480 kbps while the
+   measured link carried ~900 — half the link idle and the quality complaint to
+   match. Rice adapts its parameter per frame, so finer steps just cost bits. */
 #define MDCT_SMR_DEFAULT_DB 30.0f
 #define MDCT_SMR_MIN_DB      6.0f
-#define MDCT_SMR_MAX_DB     30.0f
+#define MDCT_SMR_MAX_DB     60.0f
 
 static float smr_db     = MDCT_SMR_DEFAULT_DB;
 static float smr_linear = 1.0e-3f;         /* 10^(-30/10) */
