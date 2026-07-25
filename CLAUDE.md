@@ -89,6 +89,11 @@ don't "fix" them back to match the prose:
   not a constant: a fixed quality means an uncontrolled bitrate, and the sender
   closes an AIMD loop on it (`abr_smr_step`) so HQ fits whatever the link
   actually carries. Dropped frames are far more audible than coarse quantisation.
+  The controller's ceiling is **54 dB** (codec clamp 60) — it was 30, which
+  pinned HQ at ~480 kbps on a measured ~900 kbps link; with the higher ceiling
+  the queue, not the constant, stops the climb, so spare link capacity becomes
+  quality. The increase is two-tier (+1.2 dB/tick while the queue is idle,
+  +0.4 near capacity) so recovery from a congestion cut doesn't take ~26 s.
 - HQ entropy stage is **Rice, not Huffman** — the HLD's "fixed tables v1.0" are
   never specified anywhere, so untrained tables would be arbitrary.
 - **HQ payload carries a 64-bit band mask** (not in the HLD): Rice never codes a
@@ -127,6 +132,18 @@ don't "fix" them back to match the prose:
 - **ABR also reacts to send-queue backpressure**, not just RSSI (`abr_update_congested`):
   a strong link can still be unable to carry NL-96k. Congestion drops a rung
   immediately and holds a ceiling for `ABR_PROBE_INTERVAL_MS` to avoid oscillation.
+- **`auto` on a real link starts at HQ-96k** (`abr_start_at`), not the HLD's
+  "optimistic" NL-96k: measured NL-96k is ~3 Mbps on real music, which no RFCOMM
+  link carries, so the optimistic start flooded the queue and cascaded to
+  HQ-48k/SMR-12 in the first second of every session. The start rung is also the
+  initial ceiling — NL must be earned via the headroom-gated probe. Loopback and
+  `--abr-demo` keep the NL-96k start (no real link; the demo sweeps the ladder).
+- **ABR switches flush the send queue** — the old mode's backlog is already
+  ~500 ms late and, left to drain, reads as the *new* mode being congested too
+  (that's the cascade above). Flushed packets are counted separately from
+  overflow drops: a flush must never feed the congestion or SMR-cut signals, or
+  each switch would trigger the next. The stats `dropped=` prints the sum so the
+  receiver's `lost` still matches.
 - **Receiver playback: fill one quantum, never `maxsize`.** PipeWire sizes
   `maxsize` for its max quantum; filling it over-drains the ring several-fold
   (huge `underruns` with `lost=0`). Pin the buffer via `SPA_PARAM_Buffers` +

@@ -203,15 +203,25 @@ The single knob is the signal-to-mask ratio, **default 30 dB**, roughly
 (`mdct_set_smr_db`), not a compile-time constant:
 
 - **Lower** it → smaller packets, lower SNR.
-- **Raise** it → better SNR, higher bitrate (capped at 30 dB).
+- **Raise** it → better SNR, higher bitrate (controller ceiling **54 dB**,
+  codec clamp 60 dB).
 
 **The sender drives it automatically.** A fixed quality means an uncontrolled
 bitrate — on a real link HQ-96k drifted from 440 to 860 kbps as the music got
 denser, overran the link and dropped ~20% of frames. `abr_smr_step()` closes an
-AIMD loop against send-queue depth: quality eases up while the queue drains,
-backs off in proportion to how far behind it gets. That is what makes fixed
-`--mode hq` smooth without needing `auto`. Watch it live in the sender's
-`smr=NNdB` field. `test_abr` proves it converges on 900 / 520 / 300 kbps links.
+AIMD loop against send-queue depth: quality eases up while the queue drains
+(+1.2 dB/tick while the queue is empty, +0.4 dB near capacity), backs off in
+proportion to how far behind it gets. That is what makes fixed `--mode hq`
+smooth without needing `auto`. Watch it live in the sender's `smr=NNdB` field.
+`test_abr` proves it converges on 900 / 520 / 300 kbps links (settling at SMR
+41.5 / 26.4 / 15.9 dB).
+
+> The ceiling used to be 30 dB, which pinned HQ at ~480 kbps while the measured
+> link carried ~900 — half the link idle, and audibly "average" quality. With
+> the 54 dB ceiling the **queue**, not the constant, is what stops the climb on
+> any realistic link: expect `smr=` to settle wherever your link's real
+> capacity is (~40–50 dB on a healthy EDR link), and expect noticeably higher
+> `[stats] kbps` in HQ than before. SMR ≈ audible SNR above the 12 dB floor.
 
 ---
 
@@ -686,17 +696,32 @@ sudo setcap cap_net_raw+ep ./src/aether_sender
 pw-play --target aether_codec_sink your_music.flac
 ```
 
+> **`auto` on a real link starts at HQ-96k, not NL-96k.** Measured NL-96k needs
+> ~3 Mbps on real music — no RFCOMM link carries that — so the old "optimistic"
+> start flooded the send queue and glitched the first seconds of *every*
+> session (that was the `dropped=71` / `underruns=41984` burst in run three).
+> The start rung is also the initial ceiling: NL rungs are only probed after
+> the link has *proven* spare capacity (queue drained AND quality already
+> pinned at the 54 dB max) — roughly one rung per 20 s, at best. On most links
+> HQ-96k never reaches the 54 dB ceiling, so `auto` simply stays there at
+> whatever quality the link affords; that is the intended steady state.
+> Loopback / `--abr-demo` keep the NL-96k start so the sweep shows the ladder.
+
 Now **physically walk A away from B** and back, watching both consoles:
 
-- 🖥️ A logs `[abr] NL-96kHz -> NL-48kHz (RSSI=… dBm)` as you move away, stepping
+- 🖥️ A logs `[abr] HQ-96kHz -> HQ-48kHz (RSSI=… dBm)` as you move away, stepping
   down the ladder; walking back **upgrades**, and each upgrade waits ~3 s.
 - 🎧 B logs `[receiver] stream rate -> 48000 Hz, mode=…` following the switches,
-  and audio stays continuous (no dropouts) across them.
+  and audio stays continuous (no dropouts) across them. ABR switches now flush
+  the sender's queued backlog, so expect a small `dropped=` uptick (mirrored in
+  the receiver's `lost=`) at each downgrade — a short concealed gap, not the
+  old multi-second cascade.
 - Cross-check the reading any time with `hcitool rssi BB:BB:BB:BB:BB:BB` on A.
 
-**Expect:** NL-96k held at 0–1 m; graceful step-down by ~5 m+; audio never cuts
-out, only changes quality. If A prints `cannot read RSSI`, the `setcap` didn't
-take (or you rebuilt the binary — re-run it) and ABR holds its current state.
+**Expect:** HQ-96k with `smr=` in the 40s at 0–1 m; graceful step-down by ~5 m+;
+audio never cuts out, only changes quality. If A prints `cannot read RSSI`, the
+`setcap` didn't take (or you rebuilt the binary — re-run it) and ABR holds its
+current state.
 
 > The live engine drives on **RSSI only** — packet-loss feedback
 > (`CTRL_STATS_REPLY`) isn't implemented yet, so a link that's strong but lossy
@@ -778,7 +803,7 @@ into the comparison table in `docs/AetherCodec_IMPLEMENTATION.md` §6.4.
 - [ ] `test_abr_switch` — sequence continuous across the ladder; HQ SNR > 15 dB after a 96k→48k switch
 - [ ] `test_resample` — 1 kHz ratio ≈ 1.00, 35 kHz rejected < −40 dB
 - [ ] `--abr-demo` — transitions logged and `mode=`/`rate=` follow, no errors
-- [ ] Real range test: NL-96k held at 0–1 m, degrades gracefully at 5 m+
+- [ ] Real range test: HQ-96k (smr ~40s) held at 0–1 m, degrades gracefully at 5 m+
 - [ ] `aether_encode`/`aether_decode` NL round-trip — bit-identical raw PCM
 - [ ] `aether_encode`/`aether_decode` HQ round-trip — `compare_spectra.py --shift 512` audible SNR ~27 dB
 - [ ] Real range/listening tests (§8.3): latency, THD+N, MUSHRA, LDAC comparison — pending real hardware

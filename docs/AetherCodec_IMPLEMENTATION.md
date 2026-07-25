@@ -2214,6 +2214,51 @@ pre-splitting only forced extra RFCOMM frames whenever that MTU was larger.
 > sender now prints a one-time warning naming the measured rate when a *fixed*
 > mode keeps dropping, instead of leaving the user to infer it from the counters.
 
+#### Third two-laptop run: smooth but mediocre — quality ceiling + startup fixed (2026-07-25)
+
+The third run was *stable* (HQ: `lost=0 underruns=0` end to end) but disappointing:
+HQ sat at ~480 kbps and "average" quality on a link whose NL run demonstrably
+carried 800–987 kbps, and `auto` opened every session with a burst of drops
+(`dropped=71`, receiver `underruns=41984`) before settling. Three causes, three
+changes:
+
+9. **The HQ quality ceiling was the bottleneck, not the link.** `ABR_SMR_MAX_DB`
+   (and the codec-side clamp in `codec_mdct_enc.c`) were both 30 dB, so the rate
+   controller pinned at max quality with roughly **half the measured link
+   unused** — the ceiling, not capacity, was deciding the sound. The controller
+   ceiling is now **54 dB** (codec clamp 60 dB); each +6 dB is ~1 bit per
+   significant coefficient (~+70 kbps at 96 kHz broadband), and audible SNR
+   tracks SMR ~1:1, so a link with spare capacity now buys quality with it.
+   `test_abr` convergence on a simulated 900 kbps link: settles at **SMR
+   41.5 dB (~937 kbps)** where it previously stopped at 30 dB. On links that
+   can't reach 54 dB the queue is what stops the climb — which also means the
+   `link_headroom` signal stays 0 and `auto` no longer re-probes NL rungs it
+   cannot carry.
+
+10. **`auto` started at NL-96k, which no RFCOMM link carries.** "Start
+    optimistic" guaranteed a ~500 ms queue flood and a congestion cascade —
+    worse, each downgrade inherited the previous mode's backlog, so the still-full
+    queue read as the *new* mode failing too, and the ladder fell all the way to
+    HQ-48k with SMR slashed to 12 in under a second, every session. `auto` on a
+    real link now starts at **HQ-96k** via `abr_start_at()`, which makes the
+    start rung the initial congestion ceiling: the NL rungs must be *earned*
+    through the headroom-gated probe (one rung per `ABR_PROBE_INTERVAL_MS`), not
+    granted because RSSI looks strong — RSSI says nothing about throughput.
+    Loopback / `--abr-demo` keep the optimistic start (no real link to flood,
+    and the demo sweeps the whole ladder).
+
+11. **ABR switches now flush the send queue.** The backlog is audio the old
+    mode over-produced, already ~`SENDQ_MAX_MS` late; draining it first delays
+    the new mode and keeps the congestion signal falsely pinned (the cascade in
+    item 10). Flushed packets are counted separately from overflow drops —
+    a flush must **not** read as fresh backpressure, or every switch would
+    trigger the next one. The stats line's `dropped=` reports the sum, so the
+    receiver's `lost` still tracks it exactly. Also: SMR recovery gained a fast
+    tier (`ABR_SMR_UP_FAST_DB`, +1.2 dB/tick while the queue is ≤10 ms) — with
+    the wider 12–54 dB range, the old 0.4 dB/tick crawl would have taken ~26 s
+    to recover from a congestion cut; it now takes ~9 s, still easing off the
+    moment the queue shows depth.
+
 ---
 
 ## Phase 6 — End-to-End Demo & Measurement

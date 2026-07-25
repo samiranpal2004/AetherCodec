@@ -45,7 +45,11 @@ float abr_smr_step(float smr_db, int queue_ms, int dropped) {
         if (cut > 6.0f) cut = 6.0f;
         smr_db -= cut;
     } else if (queue_ms < ABR_QUEUE_LOW_MS) {
-        smr_db += ABR_SMR_UP_DB;
+        /* Two-tier increase: an essentially empty queue means the link is not
+           the constraint at all, so climb fast; once the queue shows depth we
+           are near capacity and ease off to the gentle step. */
+        smr_db += (queue_ms <= ABR_SMR_IDLE_MS) ? ABR_SMR_UP_FAST_DB
+                                                : ABR_SMR_UP_DB;
     }
     if (smr_db < ABR_SMR_MIN_DB) smr_db = ABR_SMR_MIN_DB;
     if (smr_db > ABR_SMR_MAX_DB) smr_db = ABR_SMR_MAX_DB;
@@ -71,6 +75,20 @@ ABRCtrl* abr_ctrl_create(ABRCallback cb, void *userdata) {
 
 void abr_set_headroom(ABRCtrl *abr, int headroom) {
     if (abr) abr->headroom = headroom ? 1 : 0;
+}
+
+void abr_start_at(ABRCtrl *abr, ABRState state, uint64_t now_ms) {
+    if (!abr) return;
+    abr->current        = state;
+    /* Also the ceiling: states above the start point must be *earned* through
+       the headroom-gated relax path (one rung per ABR_PROBE_INTERVAL_MS), not
+       granted instantly because the RSSI looks good — RSSI says nothing about
+       throughput, and jumping straight to NL-96k on a link that cannot carry
+       it is exactly the startup flood this function exists to prevent. */
+    abr->min_state      = state;
+    abr->relax_ms       = now_ms + ABR_PROBE_INTERVAL_MS;
+    abr->last_switch_ms = now_ms;
+    abr->have_switched  = 1;   /* the first upgrade honours the normal hold */
 }
 
 ABRState abr_current_state(const ABRCtrl *abr) { return abr->current; }
