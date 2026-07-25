@@ -23,8 +23,9 @@
 #define JITTER_MS   40
 
 /* Playback ring, in output frames at SAMPLE_RATE. Must comfortably exceed the
-   playback prebuffer (250 ms) plus the largest burst the sender's send queue
-   can deliver at once, or bursts get truncated on write — which is a click. */
+   playback prebuffer (PLAY_PREBUFFER_MS, 600 ms) plus the largest burst the
+   sender's send queue can deliver at once (SENDQ_MAX_MS, 500 ms), or bursts get
+   truncated on write — which is a click. 2000 ms leaves generous headroom. */
 #define RING_MS     2000
 #define RING_VALS   (SAMPLE_RATE / 1000 * RING_MS * CHANNELS)
 
