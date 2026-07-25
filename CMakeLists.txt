@@ -12,6 +12,8 @@ option(AETHER_ENABLE_PIPEWIRE "Build PipeWire sink/source integration" ON)
 option(AETHER_ENABLE_ALSA     "Build ALSA fallback plugin"             ON)
 
 find_package(PkgConfig REQUIRED)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 # Bluetooth (BlueZ) and FFTW are always required for the codec + transport.
 pkg_check_modules(BLUEZ REQUIRED bluez)

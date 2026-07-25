@@ -1617,10 +1617,40 @@ sox -m input.flac decoded_hq.wav -n remix - stats
 
 ### ✅ Phase 3 Checkpoint
 
-- [ ] MDCT round-trip test: `inverse_mdct(mdct(x)) ≈ x` (error < 1e-5)
-- [ ] HQ encoded file sounds transparent at 900 kbps+ on headphones
-- [ ] Spectrum comparison shows no audible artifacts on music content
-- [ ] Both NL and HQ modes stream correctly over RFCOMM
+- [x] MDCT round-trip test: error **4.2e-07** (< 1e-5) — `test_mdct`, via windowed overlap-add (see note below)
+- [x] KBD window satisfies Princen-Bradley to 6.1e-08 (prerequisite for the above)
+- [x] HQ encode→decode works end-to-end with CRC-checked packets — `test_codec_hq`: audible-band SNR ~27.5 dB, broadband bitrate **1048 kbps** (inside the 900–1,100 target)
+- [ ] HQ encoded file sounds transparent at 900 kbps+ on headphones — needs listening test on real music
+- [ ] Spectrum comparison shows no audible artifacts on music content — needs WAV file tools
+- [ ] Both NL and HQ modes stream correctly over RFCOMM — needs second paired laptop
+
+> **Corrections made in Phase 3** (the doc's Step 3.1–3.5 code does not run as written):
+>
+> - **`bessel_i0` was wrong** — the doc squares `term` in place each iteration
+>   (it even flags this inline: *"wait — this is wrong"*), computing a
+>   doubly-squared series. Correct recurrence: `term *= (x/2)/k; sum += term*term`.
+> - **The MDCT sketch was not a valid MDCT** — it used a real-to-complex FFTW plan
+>   with `fftwf_creal`/`fftwf_cimag`, which are not FFTW APIs, and its
+>   pre/post-rotation did not correspond to the MDCT. Replaced with the standard
+>   **fold + DCT-IV** formulation (`FFTW_REDFT11`), which is exact and O(N log N).
+> - **Spreading function direction was inverted** — the doc uses −2.5 dB upward
+>   and 1.5 dB downward, making the downward skirt *shallower*. Measured
+>   psychoacoustics has downward steeper; now −2.5 up / −6.0 down.
+> - **Bark scaling saturated** — dividing by a fixed 24 Bark dumps ~2/3 of the
+>   96 kHz spectrum into the last band. Now normalised by the Bark value at
+>   Nyquist so 64 bands span the represented range.
+> - **ATH overflowed** — `1e-3·f_kHz⁴` reaches ~5300 dB at 48 kHz, overflowing
+>   `powf`. Clamped, and pinned to digital full scale (2²³ ≈ 96 dB SPL).
+> - **SMR raised 12 dB → 30 dB** (`MDCT_SMR_DB`). At 12 dB the codec produced only
+>   ~13 dB SNR at ~490 kbps — under half the HQ budget. 30 dB lands in target range.
+> - **Entropy stage uses Rice, not Huffman.** The HLD calls for "fixed Huffman
+>   tables v1.0" but never specifies them; untrained tables would be arbitrary.
+>   The already-proven Rice coder is adaptive per frame and needs no shipped tables.
+>
+> **On the checkpoint wording:** `inverse_mdct(mdct(x)) ≈ x` is not achievable for
+> a *single* MDCT frame — the IMDCT of one frame is time-domain aliased by
+> construction. Perfect reconstruction is a property of windowed overlap-add
+> across successive frames (TDAC); that is what `test_mdct` verifies.
 
 ---
 
@@ -1814,11 +1844,48 @@ pw-play --target aether_codec_sink your_music.flac
 
 ### ✅ Phase 4 Checkpoint
 
-- [ ] `aether_receiver` registers a visible PipeWire sink on Laptop B
-- [ ] `aether_sender` appears and captures system audio on Laptop A
-- [ ] Playing audio to the AetherCodec sink on Laptop A produces sound on Laptop B headphones
-- [ ] No audible glitches over 60-second sustained playback
-- [ ] Mode switching (NL ↔ HQ) works without audio dropout
+- [x] A visible PipeWire sink is registered — `node.name=aether_codec_sink`,
+      `media.class=Audio/Sink`, description "AetherCodec Hi-Res BT", confirmed via
+      `pw-play --list-targets`. **It lives on the sender (Laptop A)** — see note below.
+- [x] `aether_sender` captures system audio — verified with `--loopback`: 424 frames
+      (NL) and 1699 frames (HQ) captured, encoded and decoded from real `pw-play` output
+- [x] Lock-free SPSC ring buffer + jitter buffer implemented and unit-tested
+      (`test_ring`, `test_jitter`: reorder, duplicates, loss detection)
+- [ ] Playing audio on Laptop A produces sound on Laptop B headphones — needs second paired laptop
+- [ ] No audible glitches over 60-second sustained playback — needs second paired laptop
+- [ ] Mode switching (NL ↔ HQ) without dropout — encoder/decoder reset overlap state on
+      switch, but the mid-stream `CTRL_CODEC_CHANGE` signalling path is Phase 5 (ABR)
+
+> **Architecture correction — the sink belongs on the SENDER.** Step 4.1 places the
+> virtual sink on Laptop B, but Step 4.4 then runs
+> `pw-play --target aether_codec_sink` on Laptop A. Those contradict each other.
+> The product goal ("stream from any app on Laptop A, play on Laptop B's
+> headphones") only works one way:
+>
+> - **Laptop A** registers the virtual **sink**; apps play into it → capture → encode → RFCOMM
+> - **Laptop B** is a plain **playback** client: RFCOMM → jitter buffer → decode → DAC
+>
+> **Other Phase 4 corrections:**
+>
+> - The doc's `pw_sink.c` passes `&(struct spa_hook){0}` to
+>   `pw_stream_add_listener` — a compound literal whose lifetime ends at the
+>   semicolon, leaving PipeWire with a dangling pointer. Uses a real hook now.
+> - It also declares `PW_DIRECTION_OUTPUT` for something called a sink, and never
+>   connects the decoder. Rewritten around `pw_thread_loop` + `pw_stream_new_simple`.
+> - **Do not set `node.driver=true` on the sink.** A `pw_stream` provides no timing
+>   source, so claiming to be a driver can get the node selected to clock the graph,
+>   which then stalls (`streaming` state reached but `process()` never fires, and
+>   clients hang). Verified experimentally: removing it made capture work immediately.
+> - `pw_buffer.requested` only exists from PipeWire 0.3.49; guarded with
+>   `PW_CHECK_VERSION` so this builds on 0.3.48.
+> - Samples cross the PipeWire boundary as `S32` with an exact `>>8`/`<<8` to the
+>   codec's 24-bit range — no float conversion, so NL stays bit-exact.
+>
+> **New: `--loopback` mode.** `aether_sender --loopback` runs
+> capture → encode → decode → playback on a single machine, making the whole Phase 4
+> path testable without Laptop B. Add `--no-play` on a machine with no real audio
+> output, where our sink would be the default and the playback stream would
+> auto-connect back into it (feedback loop).
 
 ---
 
@@ -1977,11 +2044,55 @@ static void *abr_thread(void *arg) {
 
 ### ✅ Phase 5 Checkpoint
 
-- [ ] RSSI polling returns correct values (`hciconfig hci0` RSSI matches)
-- [ ] ABR downgrades trigger within 1 second of bad link conditions
-- [ ] ABR upgrades wait 3 seconds of good conditions before triggering
-- [ ] Mode switches do not cause audible pops or gaps > 100ms
-- [ ] System holds NL-96K at 0–1m range, degrades gracefully at 5m+
+- [x] ABR downgrades trigger within 1 second — `test_abr`: 2 polls × 500 ms = **1000 ms**
+- [x] ABR upgrades wait 3 seconds — `test_abr`: held until `ABR_UPGRADE_HOLD_MS` (3000 ms) elapsed
+- [x] Flapping link does not oscillate; stable link fires no spurious switches (`test_abr`)
+- [x] Ladder walks NL-96k → NL-48k → HQ-96k → HQ-48k in order (`test_abr`)
+- [x] 48 kHz states are functional — 2:1 resampler, `test_resample`: 1 kHz round-trip
+      ratio 1.002, 35 kHz rejected at −65.8 dB (no aliasing)
+- [x] Live integration verified with `--abr-demo`: 8 transitions over 1782 frames,
+      encoder mode/rate followed each switch, zero errors
+- [ ] RSSI polling returns correct values — needs an active BT link + `CAP_NET_RAW`
+- [ ] Mode switches do not cause audible pops or gaps > 100ms — needs listening test
+- [ ] System holds NL-96K at 0–1m range, degrades gracefully at 5m+ — needs second paired laptop
+
+> **Corrections and notes for Phase 5:**
+>
+> - **The doc's hysteresis comparison is inverted.** With `STATE_NL_96K = 0`
+>   (best) … `STATE_HQ_48K = 3` (worst), a degrading link makes `classify_link`
+>   return a *larger* value — yet Step 5.2 labels `target > abr->current` as an
+>   "upgrade" and `target < current` as a "downgrade". As written the engine
+>   raises quality exactly when the link fails. The comparisons are reversed here
+>   (`target > current` ⇒ degraded ⇒ downgrade fast).
+> - `last_switch_ms` is now updated on **every** commit, not only on upgrades, so
+>   the 3 s hold applies after a downgrade too (otherwise a downgrade is
+>   immediately followed by an eligible upgrade).
+> - **The ladder's bitrates are not monotonic** (1400 → 800 → **1000** → 600 kbps):
+>   `NL-48k → HQ-96k` *increases* demand on a worsening link. This is what PRD 4.4
+>   specifies (a quality-preference ladder: stay lossless by dropping rate first,
+>   then accept lossy at full rate), so it is implemented as written — but it is
+>   worth knowing when interpreting a range test.
+> - **Sample-rate switching needed a resampler.** Two of the four states are
+>   48 kHz, which would otherwise be inert. `src/abr/resample.c` adds a 63-tap
+>   linear-phase windowed-sinc 2:1 decimator/interpolator; the sender decimates
+>   before encoding and the receiver interpolates after decoding, so the
+>   OS-facing format stays 96 kHz throughout. **NL-48K is bit-exact only with
+>   respect to the decimated signal** — the 96→48 conversion itself is lossy, so
+>   it is a degraded fallback, not a lossless path.
+> - **Mode changes need no control packet.** Every `AetherPacket` header already
+>   carries `mode` and `sample_rate`, and the decoder flushes its state when they
+>   change. That is more robust than the HLD's single `CTRL_CODEC_CHANGE`, which
+>   would desynchronise the stream if that one packet were lost.
+> - **Not implemented: packet-loss feedback.** `abr_classify` honours the loss
+>   thresholds (and `test_abr` covers them), but the receiver's
+>   `CTRL_STATS_REPLY` back-channel does not exist, so the live engine drives on
+>   RSSI alone.
+> - **RSSI failure is not treated as a bad link.** Without `CAP_NET_RAW` (or with
+>   no active connection) the daemon warns once and *holds* the current quality;
+>   an unreadable RSSI is missing data, not evidence of a weak signal.
+> - **New: `--abr-demo`** sweeps a simulated RSSI through the real engine so the
+>   ladder can be exercised on a single machine (Step 5.3 otherwise needs two
+>   laptops and physical distance).
 
 ---
 
