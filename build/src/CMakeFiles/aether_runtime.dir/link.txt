@@ -1,2 +1,0 @@
-/usr/bin/ar qc libaether_runtime.a CMakeFiles/aether_runtime.dir/os/audio_ring.c.o CMakeFiles/aether_runtime.dir/jitter/jitter_buf.c.o CMakeFiles/aether_runtime.dir/abr/abr_ctrl.c.o CMakeFiles/aether_runtime.dir/abr/bt_rssi.c.o CMakeFiles/aether_runtime.dir/abr/resample.c.o
-/usr/bin/ranlib libaether_runtime.a

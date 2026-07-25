@@ -1,2 +1,0 @@
-/usr/bin/ar qc libaether_codec.a CMakeFiles/aether_codec.dir/encoder/codec_lpc_enc.c.o CMakeFiles/aether_codec.dir/decoder/codec_lpc_dec.c.o CMakeFiles/aether_codec.dir/encoder/codec_mdct_enc.c.o CMakeFiles/aether_codec.dir/decoder/codec_mdct_dec.c.o CMakeFiles/aether_codec.dir/encoder/aether_encoder.c.o CMakeFiles/aether_codec.dir/decoder/aether_decoder.c.o
-/usr/bin/ranlib libaether_codec.a

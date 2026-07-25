@@ -1,1 +1,0 @@
-/usr/bin/cc  -Wall -Wextra -O2 -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/aether_encode.dir/link.d CMakeFiles/aether_encode.dir/aether_encode.c.o CMakeFiles/aether_encode.dir/wav_io.c.o -o aether_encode  ../src/libaether_codec.a ../src/libaether_transport.a -lbluetooth -lfftw3f -lm
