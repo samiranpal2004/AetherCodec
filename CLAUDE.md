@@ -66,6 +66,23 @@ don't "fix" them back to match the prose:
 - `LPC_RICE_MAX_PARAM = 30`, not 15 (15 overflows the unary code on noise and
   breaks losslessness; `k` is a wire byte, so widening is free).
 - FFTW uses the single-precision module `fftw3f` (`fftwf_*`).
+- **MDCT = fold + DCT-IV (`FFTW_REDFT11`)**, not the doc's r2c-plan sketch (which
+  called non-existent `fftwf_creal`/`fftwf_cimag` and wasn't a valid MDCT).
+- `bessel_i0` uses `term *= (x/2)/k; sum += term*term` (the doc squares `term`
+  in place, which is wrong — it admits so inline).
+- Spreading function: −2.5 dB upward / **−6.0 dB downward** (the doc's 1.5 dB
+  downward makes that skirt shallower, which is backwards).
+- Bark bands normalise by the Bark value **at Nyquist**, not a fixed 24 (at 96kHz
+  a fixed 24 dumps ~2/3 of the spectrum into the last band); ATH dB is clamped
+  before `powf` (the raw formula hits ~5300 dB at 48kHz and overflows).
+- `MDCT_SMR_DB = 30`, not 12 — the rate/quality knob. 12 dB yields ~13 dB SNR at
+  ~490 kbps, under half the 900–1,100 kbps HQ budget.
+- HQ entropy stage is **Rice, not Huffman** — the HLD's "fixed tables v1.0" are
+  never specified anywhere, so untrained tables would be arbitrary.
+
+HQ mode is lossy: judge it by **audible-band** SNR (~27.5 dB) and bitrate, never
+by bit-exactness. At 96kHz the ATH correctly zeroes everything above ~17.6 kHz,
+so full-band SNR understates quality badly on broadband content.
 
 **When you find another doc/code conflict:** pick the correct behavior, add a
 short code comment explaining why, and note it under the relevant checkpoint in

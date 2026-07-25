@@ -3,31 +3,51 @@
 
 #include <stdint.h>
 
-#define MDCT_SIZE     1024   // one channel, one frame (samples)
-#define MDCT_OVERLAP  512    // 50% overlap
-#define MDCT_COEFFS   (MDCT_SIZE / 2)  // 512 output coefficients
-#define BARK_BANDS    64     // Bark-scale critical bands
+/* Perceptual HQ mode geometry (HLD 5.2):
+   window length N = 1024, hop = N/2 = 512 new samples per frame,
+   producing N/2 = 512 MDCT coefficients. */
+#define MDCT_SIZE     1024                 // window length N
+#define MDCT_HOP      (MDCT_SIZE / 2)      // new samples consumed per frame
+#define MDCT_COEFFS   (MDCT_SIZE / 2)      // coefficients produced per frame
+#define BARK_BANDS    64                   // Bark-scale critical bands
 
-/* --- Window / transform setup (idempotent, call once) --- */
-void mdct_init_window(void);
-void mdct_init_bark_table(int sample_rate);
+/* One-shot init (idempotent): KBD window, Bark table, absolute-hearing-
+   threshold table and the FFT plan. Must be called before any other function.
+   NOTE: not thread-safe (FFTW plan creation isn't); the codec is single
+   threaded today. */
+void mdct_init(int sample_rate);
 
-/* Forward MDCT: N windowed samples -> N/2 frequency coefficients. */
-void mdct_transform(const float *windowed, int N, float *out);
+/* KBD analysis/synthesis window, MDCT_SIZE entries.
+   Satisfies the Princen-Bradley condition w[n]^2 + w[n+N/2]^2 == 1, which is
+   what makes windowed MDCT -> IMDCT -> overlap-add reconstruct exactly. */
+const float* mdct_window(void);
 
-/* Inverse MDCT: N/2 coefficients -> N samples (caller does overlap-add). */
-void imdct_transform(const float *coeffs, int N, float *out);
+/* First bin of Bark band b. mdct_band_start(BARK_BANDS) == MDCT_COEFFS. */
+int mdct_band_start(int b);
 
-/* --- Psychoacoustic model --- */
-/* mdct_coeffs: MDCT_COEFFS floats; mask_out: BARK_BANDS masking thresholds. */
-void compute_masking_threshold(const float *mdct_coeffs, float *mask_out);
+/* DCT-IV of MDCT_COEFFS points. Shared by the forward and inverse transforms
+   (MDCT = fold + DCT-IV; IMDCT = DCT-IV + scale + unfold). */
+void mdct_dct4(const float *in, float *out);
 
-/* Allocate up to `total_bits` across bands (0..15 bits each). */
-void allocate_bits(const float *band_energy, const float *mask,
-                   int total_bits, int *bits_per_band);
+/* Forward MDCT: MDCT_SIZE windowed samples -> MDCT_COEFFS coefficients. */
+void mdct_forward(const float *windowed, float *coeffs_out);
 
-/* Quantize one band in place; writes the quant step used. */
-void quantize_band(float *coeffs, int start, int end,
-                   float band_energy, int bits, float *quant_step_out);
+/* Inverse MDCT: MDCT_COEFFS coefficients -> MDCT_SIZE time-aliased samples.
+   The caller must multiply by mdct_window() and overlap-add successive frames;
+   a single frame alone does NOT reconstruct the input (that is inherent to
+   MDCT's time-domain alias cancellation, not a defect). */
+void mdct_inverse(const float *coeffs, float *aliased_out);
+
+/* Psychoacoustics: per-band masking threshold (energy units) from the frame's
+   MDCT coefficients — spreading function + absolute threshold in quiet. */
+void mdct_masking_threshold(const float *coeffs, float *mask_out);
+
+/* Per-band uniform quantizer step sized so quantization noise sits at the
+   masking threshold. */
+void mdct_band_steps(const float *mask, float *step_out);
+
+/* Scale factor <-> step conversion (step is stored on the wire as a u8 index). */
+float mdct_sf_to_step(int sf_index);
+int   mdct_step_to_sf(float step);
 
 #endif /* CODEC_MDCT_H */

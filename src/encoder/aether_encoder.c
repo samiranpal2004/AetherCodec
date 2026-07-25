@@ -1,16 +1,32 @@
 #include "aether_encoder.h"
 #include "codec_lpc.h"
+#include "codec_mdct.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
-/* Payload layout (Near-Lossless):
+/* Payload layouts.
+
+   Near-Lossless (mode 0):
      [frame_samples : u16]
      per channel:
        [order : u8][rice_k : u8]
        [coeffs : order * i32][warmup : order * i32]
        [rice_len : u16][rice_bytes : rice_len]
-   channels comes from the packet header; frame_samples from the prefix, so the
-   stream is self-describing and not locked to a fixed frame size. */
+
+   Perceptual HQ (mode 1):
+     [frame_samples : u16]   (== MDCT_HOP)
+     per channel:
+       [sf_rice_k : u8][sf_len : u16][sf_bytes]    Rice-coded scalefactor deltas
+       [cf_rice_k : u8][cf_len : u16][cf_bytes]    Rice-coded quantised coeffs
+
+   Both are self-describing given the packet header (mode, channels).
+
+   HQ entropy stage: the HLD calls for Huffman with "fixed tables v1.0", but the
+   docs never specify those tables and untrained ones would be arbitrary. The
+   already-proven Rice coder is used instead — it is adaptive per frame, needs
+   no shipped tables, and suits the near-Laplacian distribution of quantised
+   MDCT coefficients. */
 
 struct AetherEncoder {
     int      mode;
@@ -18,6 +34,7 @@ struct AetherEncoder {
     int      bit_depth;
     int      channels;
     uint32_t sequence;
+    float    hist[2][MDCT_HOP];   // HQ: previous hop per channel (overlap)
 };
 
 static uint8_t rate_to_code(int sample_rate) {
@@ -38,11 +55,12 @@ AetherEncoder* aether_encoder_create(int mode, int sample_rate,
     enc->bit_depth   = bit_depth;
     enc->channels    = channels;
     enc->sequence    = 0;
+    mdct_init(sample_rate);   // idempotent; needed if/when HQ is selected
     return enc;
 }
 
-/* Encode one channel into p (with `remaining` bytes free).
-   Returns bytes written, or -1 if it would not fit. */
+/* ---- Near-Lossless ------------------------------------------------------ */
+
 static int encode_channel_nl(uint8_t *p, int remaining,
                              const int32_t *chan, int n) {
     LPCFrameHeader h = {0};
@@ -50,7 +68,7 @@ static int encode_channel_nl(uint8_t *p, int remaining,
     lpc_encode_frame(chan, n, &h, res);
     int k = rice_select_param(res + h.order, n - h.order);
 
-    int fixed = 2 + h.order * 8 + 2;      // order+k + coeffs + warmup + rice_len
+    int fixed = 2 + h.order * 8 + 2;
     if (remaining < fixed) return -1;
 
     uint8_t *start = p;
@@ -68,11 +86,70 @@ static int encode_channel_nl(uint8_t *p, int remaining,
     return (int)(p - start);
 }
 
+/* ---- Perceptual HQ ------------------------------------------------------ */
+
+/* win_buf: MDCT_SIZE already-windowed samples for this channel. */
+static int encode_channel_hq(uint8_t *p, int remaining, const float *win_buf) {
+    float coeffs[MDCT_COEFFS], mask[BARK_BANDS], step[BARK_BANDS];
+    mdct_forward(win_buf, coeffs);
+    mdct_masking_threshold(coeffs, mask);
+    mdct_band_steps(mask, step);
+
+    int32_t sf_delta[BARK_BANDS];
+    int32_t q[MDCT_COEFFS];
+    int prev_sf = 0;
+
+    for (int b = 0; b < BARK_BANDS; b++) {
+        int   sf = mdct_step_to_sf(step[b]);
+        /* Quantise with the *reconstructed* step so the decoder matches bit for
+           bit; using the unrounded step would desynchronise the two sides. */
+        float s  = mdct_sf_to_step(sf);
+        sf_delta[b] = sf - prev_sf;
+        prev_sf = sf;
+
+        for (int k = mdct_band_start(b); k < mdct_band_start(b + 1); k++) {
+            float v = coeffs[k] / s;
+            if (v >  8388607.0f) v =  8388607.0f;
+            if (v < -8388608.0f) v = -8388608.0f;
+            q[k] = (int32_t)lrintf(v);
+        }
+    }
+
+    int sfk = rice_select_param(sf_delta, BARK_BANDS);
+    int cfk = rice_select_param(q, MDCT_COEFFS);
+
+    uint8_t *start = p;
+    if (remaining < 6) return -1;
+
+    /* scalefactor block */
+    *p++ = (uint8_t)sfk;
+    int cap = remaining - (int)(p - start) - 2;
+    int sfbytes = rice_encode(sf_delta, BARK_BANDS, sfk, p + 2, cap);
+    if (sfbytes < 0) return -1;
+    uint16_t sl = (uint16_t)sfbytes;
+    memcpy(p, &sl, 2); p += 2 + sfbytes;
+
+    /* coefficient block */
+    if (remaining - (int)(p - start) < 3) return -1;
+    *p++ = (uint8_t)cfk;
+    cap = remaining - (int)(p - start) - 2;
+    int cfbytes = rice_encode(q, MDCT_COEFFS, cfk, p + 2, cap);
+    if (cfbytes < 0) return -1;
+    uint16_t cl = (uint16_t)cfbytes;
+    memcpy(p, &cl, 2); p += 2 + cfbytes;
+
+    return (int)(p - start);
+}
+
+/* ---- Public API --------------------------------------------------------- */
+
 int aether_encoder_encode(AetherEncoder *enc, const int32_t *pcm,
                           int frame_samples, AetherPacket *pkt_out) {
-    if (enc->mode != AETHER_MODE_NL) return -1;   // Phase 2: NL only (HQ later)
-    if (frame_samples <= 0 || frame_samples > LPC_FRAME_SIZE) return -1;
     if (enc->channels != 1 && enc->channels != 2) return -1;
+    if (frame_samples <= 0) return -1;
+    if (enc->mode == AETHER_MODE_NL  && frame_samples > LPC_FRAME_SIZE) return -1;
+    if (enc->mode == AETHER_MODE_HQ  && frame_samples != MDCT_HOP)      return -1;
+    if (enc->mode != AETHER_MODE_NL && enc->mode != AETHER_MODE_HQ)     return -1;
 
     memset(pkt_out, 0, sizeof(*pkt_out));
     pkt_out->hdr.magic        = AETHER_MAGIC;
@@ -83,28 +160,38 @@ int aether_encoder_encode(AetherEncoder *enc, const int32_t *pcm,
     pkt_out->hdr.bit_depth    = (uint8_t)enc->bit_depth;
     pkt_out->hdr.channels     = (uint8_t)enc->channels;
 
-    uint8_t *p   = pkt_out->payload;
+    uint8_t *p    = pkt_out->payload;
     int remaining = (int)sizeof(pkt_out->payload);
 
     uint16_t fs = (uint16_t)frame_samples;
     memcpy(p, &fs, 2); p += 2; remaining -= 2;
 
-    if (enc->channels == 2) {
-        int32_t left[LPC_FRAME_SIZE], right[LPC_FRAME_SIZE];
-        for (int i = 0; i < frame_samples; i++) {
-            left[i]  = pcm[i * 2];
-            right[i] = pcm[i * 2 + 1];
+    if (enc->mode == AETHER_MODE_NL) {
+        int32_t chan[LPC_FRAME_SIZE];
+        for (int c = 0; c < enc->channels; c++) {
+            for (int i = 0; i < frame_samples; i++)
+                chan[i] = pcm[i * enc->channels + c];
+            int n = encode_channel_nl(p, remaining, chan, frame_samples);
+            if (n < 0) return -1;
+            p += n; remaining -= n;
         }
-        int nl_ = encode_channel_nl(p, remaining, left, frame_samples);
-        if (nl_ < 0) return -1;
-        p += nl_; remaining -= nl_;
-        int nr = encode_channel_nl(p, remaining, right, frame_samples);
-        if (nr < 0) return -1;
-        p += nr; remaining -= nr;
-    } else {
-        int nc = encode_channel_nl(p, remaining, pcm, frame_samples);
-        if (nc < 0) return -1;
-        p += nc;
+    } else {  /* AETHER_MODE_HQ */
+        const float *w = mdct_window();
+        for (int c = 0; c < enc->channels; c++) {
+            float buf[MDCT_SIZE];
+            /* previous hop, then this hop */
+            memcpy(buf, enc->hist[c], MDCT_HOP * sizeof(float));
+            for (int i = 0; i < MDCT_HOP; i++) {
+                float s = (float)pcm[i * enc->channels + c];
+                buf[MDCT_HOP + i] = s;
+                enc->hist[c][i]   = s;
+            }
+            for (int n = 0; n < MDCT_SIZE; n++) buf[n] *= w[n];
+
+            int n = encode_channel_hq(p, remaining, buf);
+            if (n < 0) return -1;
+            p += n; remaining -= n;
+        }
     }
 
     pkt_out->hdr.payload_size = (uint16_t)(p - pkt_out->payload);
@@ -112,7 +199,9 @@ int aether_encoder_encode(AetherEncoder *enc, const int32_t *pcm,
 }
 
 void aether_encoder_set_mode(AetherEncoder *enc, int new_mode) {
+    if (new_mode == enc->mode) return;
     enc->mode = new_mode;
+    memset(enc->hist, 0, sizeof(enc->hist));   // overlap state is mode-specific
 }
 
 void aether_encoder_destroy(AetherEncoder *enc) { free(enc); }

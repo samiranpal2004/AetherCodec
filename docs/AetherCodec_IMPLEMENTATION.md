@@ -1617,10 +1617,40 @@ sox -m input.flac decoded_hq.wav -n remix - stats
 
 ### ✅ Phase 3 Checkpoint
 
-- [ ] MDCT round-trip test: `inverse_mdct(mdct(x)) ≈ x` (error < 1e-5)
-- [ ] HQ encoded file sounds transparent at 900 kbps+ on headphones
-- [ ] Spectrum comparison shows no audible artifacts on music content
-- [ ] Both NL and HQ modes stream correctly over RFCOMM
+- [x] MDCT round-trip test: error **4.2e-07** (< 1e-5) — `test_mdct`, via windowed overlap-add (see note below)
+- [x] KBD window satisfies Princen-Bradley to 6.1e-08 (prerequisite for the above)
+- [x] HQ encode→decode works end-to-end with CRC-checked packets — `test_codec_hq`: audible-band SNR ~27.5 dB, broadband bitrate **1048 kbps** (inside the 900–1,100 target)
+- [ ] HQ encoded file sounds transparent at 900 kbps+ on headphones — needs listening test on real music
+- [ ] Spectrum comparison shows no audible artifacts on music content — needs WAV file tools
+- [ ] Both NL and HQ modes stream correctly over RFCOMM — needs second paired laptop
+
+> **Corrections made in Phase 3** (the doc's Step 3.1–3.5 code does not run as written):
+>
+> - **`bessel_i0` was wrong** — the doc squares `term` in place each iteration
+>   (it even flags this inline: *"wait — this is wrong"*), computing a
+>   doubly-squared series. Correct recurrence: `term *= (x/2)/k; sum += term*term`.
+> - **The MDCT sketch was not a valid MDCT** — it used a real-to-complex FFTW plan
+>   with `fftwf_creal`/`fftwf_cimag`, which are not FFTW APIs, and its
+>   pre/post-rotation did not correspond to the MDCT. Replaced with the standard
+>   **fold + DCT-IV** formulation (`FFTW_REDFT11`), which is exact and O(N log N).
+> - **Spreading function direction was inverted** — the doc uses −2.5 dB upward
+>   and 1.5 dB downward, making the downward skirt *shallower*. Measured
+>   psychoacoustics has downward steeper; now −2.5 up / −6.0 down.
+> - **Bark scaling saturated** — dividing by a fixed 24 Bark dumps ~2/3 of the
+>   96 kHz spectrum into the last band. Now normalised by the Bark value at
+>   Nyquist so 64 bands span the represented range.
+> - **ATH overflowed** — `1e-3·f_kHz⁴` reaches ~5300 dB at 48 kHz, overflowing
+>   `powf`. Clamped, and pinned to digital full scale (2²³ ≈ 96 dB SPL).
+> - **SMR raised 12 dB → 30 dB** (`MDCT_SMR_DB`). At 12 dB the codec produced only
+>   ~13 dB SNR at ~490 kbps — under half the HQ budget. 30 dB lands in target range.
+> - **Entropy stage uses Rice, not Huffman.** The HLD calls for "fixed Huffman
+>   tables v1.0" but never specifies them; untrained tables would be arbitrary.
+>   The already-proven Rice coder is adaptive per frame and needs no shipped tables.
+>
+> **On the checkpoint wording:** `inverse_mdct(mdct(x)) ≈ x` is not achievable for
+> a *single* MDCT frame — the IMDCT of one frame is time-domain aliased by
+> construction. Perfect reconstruction is a property of windowed overlap-add
+> across successive frames (TDAC); that is what `test_mdct` verifies.
 
 ---
 
