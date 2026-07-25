@@ -19,6 +19,18 @@ void aether_pw_init_once(void);   /* defined in pw_sink.c */
    has no pw_buffer.requested to tell us the real amount). */
 #define PLAY_QUANTUM 1024
 
+/* Prebuffer cushion, in milliseconds, before playout starts (and rebuilt after
+   any full drain). This MUST exceed the sender's send-queue hold
+   (SENDQ_MAX_MS, 500 ms in aether_sender.c): the sender will delay a packet by
+   up to that long during a Bluetooth stall before it drops anything, so a
+   smaller cushion here underruns on every such stall *even though no packet is
+   lost* (observed as `underruns` climbing in chunks while `lost=0 dropped=0`).
+   Sized above 500 ms so a burst the sender rides out by queuing is one the
+   receiver rides out by buffering; a stall longer than the sender's hold makes
+   it drop (bounding the delivery delay), and the receiver conceals that gap.
+   Trades latency for smoothness — the right call for music, not gaming. */
+#define PLAY_PREBUFFER_MS 600
+
 struct PwPlay {
     struct pw_thread_loop *loop;
     struct pw_stream      *stream;
@@ -106,11 +118,10 @@ PwPlay* pw_play_start(const char *name, int rate, int channels, AudioRing *ring)
     if (!p) return NULL;
     p->ring     = ring;
     p->channels = channels;
-    /* ~250 ms cushion before playout starts. Bigger than the pipeline latency
-       target on purpose: Bluetooth delivers in bursts (especially the large
-       NL frames), and a deep cushion is what keeps playback continuous between
-       bursts. Trades latency for smoothness — the right call for music. */
-    p->target_frames = (uint32_t)rate / 4;
+    /* Cushion before playout starts (see PLAY_PREBUFFER_MS). Deep on purpose:
+       Bluetooth delivers in bursts, and this cushion is what keeps playback
+       continuous across a stall the sender rode out by queuing. */
+    p->target_frames = (uint32_t)rate * PLAY_PREBUFFER_MS / 1000u;
 
     p->loop = pw_thread_loop_new("aether-play", NULL);
     if (!p->loop) { free(p); return NULL; }

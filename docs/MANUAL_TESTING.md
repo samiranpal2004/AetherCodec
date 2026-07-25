@@ -311,7 +311,10 @@ pw-play --target aether_codec_sink your_music.flac
 > **Stutter?** The bitrate a mode needs may exceed what the link smoothly
 > carries. The sender decouples encode from send (a queue + send thread, bounded
 > at ~500 ms of *queued audio* so NL and HQ get the same slack) and the receiver
-> prebuffers ~250 ms, so a mode that *fits* plays cleanly. If a **fixed** mode
+> prebuffers ~600 ms — deliberately more than the sender's 500 ms hold, so a
+> Bluetooth burst the sender rides out by queuing the receiver rides out by
+> buffering (a smaller cushion underran on every stall, `underruns` climbing
+> while `lost=0`). So a mode that *fits* plays cleanly. If a **fixed** mode
 > still stutters, the link can't carry it — use `--mode auto`, which steps down
 > on **send-queue backpressure** (see §7), not just RSSI. Watch the sender's
 > `queue=…ms` / `dropped=` fields: a queue that stays high or a rising `dropped`
@@ -775,8 +778,9 @@ into the comparison table in `docs/AetherCodec_IMPLEMENTATION.md` §6.4.
 | Streaming works but audio comes out of **A's** speakers | forgot `--target aether_codec_sink` on `pw-play` | Our sink has priority −1, so A's real output stays default; always target the sink |
 | B decodes garbage / loud noise | mismatched builds on A and B | Rebuild both from the same commit (no wire-format versioning) |
 | Two-machine `garbled after a while`, `underruns` climbing | link below the codec's bitrate | Check §9.2 throughput; use `--mode auto` or `hq` |
-| Stutter with **`lost=0` but huge `underruns`** (≫ playtime) | playback over-drained the ring (fixed) | Rebuild — playback now pins one quantum + prebuffers ~100 ms. `underruns` far exceeding total samples played meant the buffer was pulled several× realtime |
-| Rare click every few minutes, otherwise smooth | A/B sample-clock drift | Expected for now — no async resampler; the ~100 ms prebuffer re-primes on a full drain |
+| Stutter with **`lost=0` but huge `underruns`** (≫ playtime) | playback over-drained the ring (fixed) | Rebuild — playback pins one quantum. `underruns` far exceeding total samples played meant the buffer was pulled several× realtime |
+| Periodic breaks; `underruns` climbs in chunks while **`lost=0` AND sender `dropped=0`** (fixed) | receiver cushion smaller than the sender's queue hold | Rebuild — the receiver prebuffer is now 600 ms (> the sender's 500 ms hold). The sender delays a packet up to 500 ms during a Bluetooth stall before dropping; a 250 ms cushion underran on every stall longer than itself even though every packet arrived |
+| Rare click every few minutes, otherwise smooth | A/B sample-clock drift | Expected for now — no async resampler; the prebuffer re-primes on a full drain |
 | Receiver `played` frozen while `recv` climbs, `lost` flat | sender's packet sequence restarted (fixed) | Rebuild both sides. ABR switches used to recreate the encoder, resetting `sequence` to 0; the jitter buffer then discarded everything as "already played". It now re-anchors on a large discontinuity too |
 | `auto` sounds fine in NL but HQ is noise/dull after a switch | MDCT rate tables latched (fixed) | Rebuild both sides — `mdct_init()` now rebuilds the Bark/ATH tables when the rate changes. Mismatched tables between A and B decode as noise |
 | Receiver `lost` tracks the sender's `dropped` exactly | not on-air loss at all | RFCOMM is reliable; every "lost" packet was dropped from the sender's send queue. Read the *sender's* `dropped`, and treat it as "this mode is over the link's budget" |

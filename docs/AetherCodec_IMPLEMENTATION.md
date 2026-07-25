@@ -2259,6 +2259,41 @@ changes:
     to recover from a congestion cut; it now takes ~9 s, still easing off the
     moment the queue shows depth.
 
+#### Fourth two-laptop run: periodic breaks at `lost=0` — receiver cushion (2026-07-25)
+
+Run four confirmed HQ now reaches ~600–640 kbps at SMR 54 (quality fixed), but
+playback still *broke periodically* in both HQ and auto. The receiver capture
+was decisive: `underruns` climbed in **discrete chunks** (0 → 38912 → 58368 →
+68608) while `lost=0` **and** the sender's `dropped=0`. Every packet arrived and
+decoded — the DAC ran dry anyway. That is jitter starvation, not loss.
+
+12. **The receiver prebuffer was smaller than the sender's send-queue hold.**
+    The sender holds a packet up to `SENDQ_MAX_MS` (500 ms) during a Bluetooth
+    stall before it drops anything — and the link genuinely stalls that long
+    (the `link=0 kbps` readings are complete ≥250 ms gaps, followed by a
+    catch-up burst at `link>1000 kbps`). The receiver only cushioned
+    `rate/4` = **250 ms**, so any stall between 250 and 500 ms drained the ring
+    to empty and underran, with the packets arriving intact moments later. The
+    two constants were never reconciled. The cushion (`PLAY_PREBUFFER_MS`) is now
+    **600 ms**, deliberately above the sender's 500 ms hold: a burst the sender
+    rides out by queuing, the receiver now rides out by buffering. A stall longer
+    than 500 ms makes the sender drop (bounding the delivery delay), and the
+    receiver conceals that bounded gap. Costs ~350 ms of added latency — the
+    right trade for a music codec, and in line with the existing "trade latency
+    for smoothness" prebuffer rationale. The 2000 ms playback ring already fits
+    600 ms cushion + a 500 ms burst with room to spare.
+
+> **Auto still favours the bottom rung on a bursty link (separate from the
+> breaks).** In run four `auto` dropped to HQ-48k on an early burst and stayed
+> there, even though the dedicated HQ-96k run proved the same link sustains
+> HQ-96k. The sender flags congestion on any transient queue spike over
+> `SENDQ_HIGH_MS` (200 ms) — but with the 600 ms receiver cushion those spikes
+> are now absorbed and are no longer real dropouts, so the congestion trigger is
+> more pessimistic than it needs to be. Tuning that (congest on sustained depth
+> or actual drops, not a single transient spike) is the next step if `auto`
+> still under-selects after the cushion fix; it is a rung-selection/quality
+> issue, not the break itself, so it is deliberately left for its own run.
+
 ---
 
 ## Phase 6 — End-to-End Demo & Measurement

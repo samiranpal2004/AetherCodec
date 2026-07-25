@@ -147,8 +147,14 @@ don't "fix" them back to match the prose:
 - **Receiver playback: fill one quantum, never `maxsize`.** PipeWire sizes
   `maxsize` for its max quantum; filling it over-drains the ring several-fold
   (huge `underruns` with `lost=0`). Pin the buffer via `SPA_PARAM_Buffers` +
-  `NODE_LATENCY`; `pw_buffer.requested` is absent before 0.3.49. Playback also
-  prebuffers ~250 ms to absorb Bluetooth bursts.
+  `NODE_LATENCY`; `pw_buffer.requested` is absent before 0.3.49.
+- **Receiver prebuffer (`PLAY_PREBUFFER_MS`) must exceed the sender's queue hold
+  (`SENDQ_MAX_MS`).** The sender delays a packet up to `SENDQ_MAX_MS` (500 ms)
+  during a Bluetooth stall before dropping; if the receiver cushion is smaller,
+  it underruns on every such stall *even with no packet lost* — `underruns`
+  climbing in chunks while `lost=0 dropped=0` is the signature. Cushion is
+  600 ms (> 500 ms) so a burst the sender rides out by queuing, the receiver
+  rides out by buffering. Trades latency for smoothness — right for music.
 - NL-48K is lossless only *relative to the decimated signal*; 96→48 itself is
   lossy. Don't claim end-to-end bit-exactness for the 48k states.
 
