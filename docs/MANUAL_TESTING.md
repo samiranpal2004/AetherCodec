@@ -275,8 +275,16 @@ pw-play --target aether_codec_sink your_music.flac
 
 **Expect:** audio on B's headphones, and receiver stats showing
 `recv= played= lost= buffer=…ms underruns=`. Sustained playback should hold
-`lost=0` and `underruns=0`; rising underruns means the link cannot keep up
-(check §3.2 throughput) — that is what Phase 5's ABR will address.
+`lost=0` and `underruns` near 0 and flat.
+
+> **Stutter?** The bitrate a mode needs may exceed what the link smoothly
+> carries — NL-96k (~1,400 kbps, often higher on dense music) is the hardest.
+> The sender decouples encode from send (a queue + send thread) and the receiver
+> prebuffers ~250 ms, so a mode that *fits* plays cleanly. If a **fixed** mode
+> still stutters, the link can't carry it — use `--mode auto`, which now steps
+> down on **send-queue backpressure** (see §7), not just RSSI. Watch the
+> sender's `queue=`/`dropped=` fields: a queue that stays high or a rising
+> `dropped` count means that mode is over budget.
 
 ### 6.4 Known environment limitation
 
@@ -389,11 +397,18 @@ Without `CAP_NET_RAW` the daemon prints a one-time warning and **holds** the
 current quality rather than assuming the worst — an unreadable RSSI is not
 evidence of a bad link.
 
-> **Not implemented:** packet-loss feedback. The ladder's loss thresholds are
-> honoured by `abr_classify`, but the receiver's `CTRL_STATS_REPLY` back-channel
-> does not exist yet, so the live engine drives on RSSI alone (loss is passed as
-> 0). Loss-driven switching is covered by `test_abr` but cannot yet happen on a
-> real link.
+> **Backpressure (the important one for a strong but slow link).** RSSI can be
+> excellent while the link still cannot carry NL-96k. The engine therefore also
+> watches the sender's **send-queue depth**: when it backs up, `auto` drops a
+> rung immediately (even at −16 dBm) and won't climb back into that mode for
+> ~20 s, so it settles on the best mode the link can actually sustain. This is
+> why `auto` can sound clean where fixed NL-96k stutters. Covered by `test_abr`
+> (`congestion steps down despite strong RSSI`).
+>
+> **Not implemented:** on-air packet-loss feedback. `abr_classify` honours the
+> loss thresholds (and `test_abr` covers them), but the receiver's
+> `CTRL_STATS_REPLY` back-channel does not exist yet, so loss itself isn't
+> reported back — congestion is inferred from the send queue instead.
 
 ---
 

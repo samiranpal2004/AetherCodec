@@ -108,6 +108,29 @@ int main(void) {
     printf("\xE2\x9C\x93 abr: walking away steps NL-96k -> NL-48k -> HQ-96k -> HQ-48k\n");
     abr_ctrl_destroy(a);
 
+    /* --- 8. backpressure: strong RSSI but congested link must step down ---- */
+    a = abr_ctrl_create(NULL, NULL);
+    t = 0;
+    /* RSSI says NL-96k is fine, but the send queue is backing up. */
+    abr_update_congested(a, -50, 0.0f, 1, t); t += TICK_MS;
+    assert(abr_current_state(a) == ABR_STATE_NL_48K);   /* immediate 1-step drop */
+    abr_update_congested(a, -50, 0.0f, 1, t); t += TICK_MS;
+    assert(abr_current_state(a) == ABR_STATE_HQ_96K);   /* still congested: again */
+    printf("\xE2\x9C\x93 abr: congestion steps down despite strong RSSI\n");
+
+    /* Congestion clears, RSSI still great — must NOT immediately climb back into
+       the mode that just failed (would re-congest and blip). */
+    for (int i = 0; i < 12; i++) { abr_update_congested(a, -50, 0.0f, 0, t); t += TICK_MS; }
+    assert(abr_current_state(a) == ABR_STATE_HQ_96K);
+    printf("\xE2\x9C\x93 abr: does not oscillate back into the congested mode\n");
+
+    /* After the probe interval, it may cautiously climb one rung again. */
+    t += ABR_PROBE_INTERVAL_MS;
+    for (int i = 0; i < 5; i++) { abr_update_congested(a, -50, 0.0f, 0, t); t += TICK_MS; }
+    assert(abr_current_state(a) < ABR_STATE_HQ_96K);
+    printf("\xE2\x9C\x93 abr: probes back up after the backoff interval\n");
+    abr_ctrl_destroy(a);
+
     printf("\nAll ABR tests passed.\n");
     return 0;
 }

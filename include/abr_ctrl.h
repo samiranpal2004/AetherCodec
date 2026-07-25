@@ -32,6 +32,11 @@ typedef enum {
 #define ABR_UPGRADE_CONSECUTIVE   3
 #define ABR_UPGRADE_HOLD_MS       3000
 
+/* After congestion forces a downgrade, how long before the engine probes one
+   step back up. Long, so a link that simply can't carry a mode doesn't keep
+   retrying it (each retry is an audible blip). */
+#define ABR_PROBE_INTERVAL_MS     20000
+
 typedef struct ABRCtrl ABRCtrl;
 
 /* Fired when the engine commits to a new operating point. */
@@ -48,6 +53,15 @@ void abr_update(ABRCtrl *abr, int rssi_dbm, float packet_loss_pct,
    deterministically instead of by sleeping. */
 void abr_update_at(ABRCtrl *abr, int rssi_dbm, float packet_loss_pct,
                    int jitter_buf_level_ms, uint64_t now_ms);
+
+/* Congestion-aware update. `congested` means the sender cannot push the current
+   mode fast enough (its send queue is backing up) — a throughput problem the
+   RSSI does not reflect. When set, the engine drops at least one rung
+   immediately and refuses to climb back above that rung for ABR_PROBE_INTERVAL_MS,
+   so `auto` settles on the best mode the link can actually carry. This is the
+   path the sender daemon uses; RSSI/loss still apply on top. */
+void abr_update_congested(ABRCtrl *abr, int rssi_dbm, float packet_loss_pct,
+                          int congested, uint64_t now_ms);
 
 /* Pure classification of a link condition — no hysteresis, no state. */
 ABRState abr_classify(int rssi_dbm, float packet_loss_pct);

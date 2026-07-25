@@ -9,6 +9,9 @@ struct ABRCtrl {
     int          bad_count;
     uint64_t     last_switch_ms;
     int          have_switched;
+    ABRState     min_state;        /* best (numerically lowest) state allowed;
+                                      raised by congestion, relaxed over time */
+    uint64_t     relax_ms;         /* next time min_state may relax one step */
     ABRCallback  callback;
     void        *userdata;
 };
@@ -92,6 +95,47 @@ void abr_update_at(ABRCtrl *abr, int rssi_dbm, float loss_pct,
 void abr_update(ABRCtrl *abr, int rssi_dbm, float loss_pct, int jitter_level_ms) {
     abr_update_at(abr, rssi_dbm, loss_pct, jitter_level_ms,
                   aether_timestamp_us() / 1000ULL);
+}
+
+void abr_update_congested(ABRCtrl *abr, int rssi_dbm, float loss_pct,
+                          int congested, uint64_t now_ms) {
+    /* Relax the congestion ceiling one step at a time so a link that recovers
+       can climb back up. */
+    if (abr->min_state > ABR_STATE_NL_96K && now_ms >= abr->relax_ms) {
+        abr->min_state--;
+        abr->relax_ms = now_ms + ABR_PROBE_INTERVAL_MS;
+    }
+
+    ABRState target = abr_classify(rssi_dbm, loss_pct);
+
+    if (congested) {
+        /* Current mode doesn't fit — forbid it and everything better, and hold
+           that ceiling for a while so we don't immediately probe back into it. */
+        ABRState worse = (ABRState)(abr->current + 1);
+        if (worse > ABR_STATE_HQ_48K) worse = ABR_STATE_HQ_48K;
+        if (worse > abr->min_state) abr->min_state = worse;
+        abr->relax_ms = now_ms + ABR_PROBE_INTERVAL_MS;
+    }
+
+    if (target < abr->min_state) target = abr->min_state;   /* clamp to allowed */
+
+    if (target > abr->current) {
+        /* Degraded. Congestion commits immediately (audible now); an RSSI-only
+           degrade still waits for the usual consecutive-bad hysteresis. */
+        abr->good_count = 0;
+        if (congested || ++abr->bad_count >= ABR_DOWNGRADE_CONSECUTIVE)
+            commit(abr, target, now_ms);
+    } else if (target < abr->current) {
+        abr->bad_count = 0;
+        abr->good_count++;
+        int held = !abr->have_switched ||
+                   (now_ms - abr->last_switch_ms) >= ABR_UPGRADE_HOLD_MS;
+        if (abr->good_count >= ABR_UPGRADE_CONSECUTIVE && held)
+            commit(abr, target, now_ms);
+    } else {
+        abr->good_count = 0;
+        abr->bad_count  = 0;
+    }
 }
 
 void abr_ctrl_destroy(ABRCtrl *abr) { free(abr); }

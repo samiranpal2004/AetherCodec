@@ -93,8 +93,11 @@ PwPlay* pw_play_start(const char *name, int rate, int channels, AudioRing *ring)
     if (!p) return NULL;
     p->ring     = ring;
     p->channels = channels;
-    /* ~100 ms cushion before playout starts (a handful of NL frames). */
-    p->target_frames = (uint32_t)rate / 10;
+    /* ~250 ms cushion before playout starts. Bigger than the pipeline latency
+       target on purpose: Bluetooth delivers in bursts (especially the large
+       NL frames), and a deep cushion is what keeps playback continuous between
+       bursts. Trades latency for smoothness — the right call for music. */
+    p->target_frames = (uint32_t)rate / 4;
 
     p->loop = pw_thread_loop_new("aether-play", NULL);
     if (!p->loop) { free(p); return NULL; }
