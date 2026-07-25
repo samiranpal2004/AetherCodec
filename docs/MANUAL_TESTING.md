@@ -1,8 +1,8 @@
 # AetherCodec — Manual Testing Guide
 
 A short, step-by-step guide to build AetherCodec and manually verify each phase
-that is currently implemented (**Phase 0–2**). Later phases (PipeWire, ABR) will
-be added here as they land.
+that is currently implemented (**Phase 0–4**). Later phases (ABR) will be added
+here as they land.
 
 > **Legend**
 > - 🖥️ **A** = Laptop A (sender)   🎧 **B** = Laptop B (receiver)
@@ -16,13 +16,15 @@ be added here as they land.
 cd ~/aethercodec
 rm -rf build && mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release \
-         -DAETHER_ENABLE_PIPEWIRE=OFF \
+         -DAETHER_ENABLE_PIPEWIRE=ON \
          -DAETHER_ENABLE_ALSA=OFF
 make -j$(nproc)
 ```
 
-**Expect:** builds with **no warnings or errors**. PipeWire/ALSA are OFF because
-the OS-integration layer (Phase 4) isn't implemented yet.
+**Expect:** builds with **no warnings or errors**, producing `src/aether_sender`
+and `src/aether_receiver` alongside the tools and tests. ALSA stays OFF (the
+fallback plugin is not implemented). Building with
+`-DAETHER_ENABLE_PIPEWIRE=OFF` still works and simply omits the two daemons.
 
 ---
 
@@ -33,18 +35,23 @@ cd ~/aethercodec/build
 ctest --output-on-failure
 ```
 
-**Expect:** `100% tests passed, 0 tests failed out of 3`.
+**Expect:** `100% tests passed, 0 tests failed out of 7`.
 
 Run them individually to see the detail:
 
 ```bash
 ./tests/test_packet     # packet pack/unpack + CRC corruption detection
 ./tests/test_lpc        # LPC + Rice bit-perfect round-trip (sine / noise / silence)
-./tests/test_codec_nl   # full encoder → packet → decoder stereo round-trip
+./tests/test_codec_nl   # NL: full encoder → packet → decoder stereo round-trip
+./tests/test_mdct       # MDCT window + perfect-reconstruction check
+./tests/test_codec_hq   # HQ: full encode → decode, SNR + bitrate report
+./tests/test_ring       # lock-free SPSC ring, incl. threaded producer/consumer
+./tests/test_jitter     # jitter buffer: reorder, duplicate, loss detection
 ```
 
-**Expect:** every line reports `LOSSLESS (0 mismatches)`. Any mismatch is a
-**hard failure** — the near-lossless mode must be bit-perfect.
+**Expect:** every NL line reports `LOSSLESS (0 mismatches)`. Any mismatch there
+is a **hard failure** — near-lossless mode must be bit-perfect. HQ is lossy by
+design, so it reports SNR/bitrate instead (see §5).
 
 ---
 
@@ -123,7 +130,70 @@ ride the pipe you already verified in 3.1–3.3.
 
 ---
 
-## 5. Common issues
+## 5. Phase 3 — Perceptual HQ codec (💻)
+
+HQ mode is **lossy on purpose**, so "0 mismatches" does not apply. Two tests
+cover it.
+
+### 5.1 Transform correctness — `test_mdct`
+
+```bash
+./tests/test_mdct
+```
+
+**Expect:**
+- `Princen-Bradley max deviation` **< 1e-6** — the KBD window is valid. If this
+  fails, overlap-add can never reconstruct and everything downstream is noise.
+- `MDCT/IMDCT overlap-add max reconstruction error` **< 1e-5** (currently
+  ~4e-07). This is the Phase 3 checkpoint number.
+- Bark table spans all 512 bins, non-decreasing.
+
+> A single MDCT frame does **not** invert to its input — the IMDCT of one frame
+> is time-domain *aliased* by design. Reconstruction only becomes exact after
+> windowed overlap-add of successive frames, which is what the test does.
+
+### 5.2 Codec quality & bitrate — `test_codec_hq`
+
+```bash
+./tests/test_codec_hq
+```
+
+**Expect** two rows, tonal and broadband. Reference numbers:
+
+| Signal    | SNR full | SNR audible | Bitrate   |
+|-----------|----------|-------------|-----------|
+| tonal     | ~27.5 dB | ~27.5 dB    | ~540 kbps |
+| broadband | ~13 dB   | ~27.6 dB    | ~1050 kbps |
+
+How to read this:
+
+- **Bitrate is content-adaptive.** Sparse tonal material needs far fewer bits
+  than dense broadband material. Broadband (~1050 kbps) is the realistic worst
+  case and lands inside the PRD's **900–1,100 kbps** HQ target.
+- **Two SNRs are reported on purpose.** At 96 kHz the spectrum runs to 48 kHz,
+  but the absolute threshold of hearing correctly quantises everything above
+  ~17.6 kHz to zero. That discarded ultrasonic content is what drags *full-band*
+  SNR down to ~13 dB on broadband. The **audible-band** figure (same low-pass
+  applied to reference and decoded) is the meaningful one — and it holds ~27.5 dB
+  for both signal types.
+- A broken transform or quantiser collapses audible SNR far below 20 dB; that is
+  what the test asserts on.
+
+### 5.3 Tuning quality vs bitrate
+
+The single knob is `MDCT_SMR_DB` in `src/encoder/codec_mdct_enc.c`
+(signal-to-mask ratio, currently **30 dB**). Roughly **6 dB ≈ 1 bit** per
+significant coefficient:
+
+- **Lower** it (e.g. 24) → smaller packets, lower SNR.
+- **Raise** it (e.g. 36) → better SNR, higher bitrate.
+
+Rebuild and re-run `test_codec_hq` to see the new operating point. The doc's
+suggested 12 dB gives only ~13 dB SNR at ~490 kbps — under half the HQ budget.
+
+---
+
+## 6. Common issues
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -135,11 +205,13 @@ ride the pipe you already verified in 3.1–3.3.
 
 ---
 
-## 6. Quick checklist
+## 7. Quick checklist
 
 - [ ] `make` — clean build, no warnings
-- [ ] `ctest` — 3/3 pass
+- [ ] `ctest` — 5/5 pass
 - [ ] `rfcomm_ping` — 10 pings received on B
 - [ ] `rfcomm_bench` — throughput recorded: ______ kbps
 - [ ] `raw_stream` — audible on B
 - [ ] `test_lpc` / `test_codec_nl` — 0 mismatches (bit-perfect)
+- [ ] `test_mdct` — reconstruction error < 1e-5
+- [ ] `test_codec_hq` — audible SNR ~27 dB, broadband bitrate in 900–1,100 kbps
