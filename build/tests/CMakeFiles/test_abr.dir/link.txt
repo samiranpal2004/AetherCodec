@@ -1,0 +1,1 @@
+/usr/bin/cc  -Wall -Wextra -O2 -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/test_abr.dir/link.d CMakeFiles/test_abr.dir/test_abr.c.o -o test_abr  ../src/libaether_runtime.a ../src/libaether_transport.a -lbluetooth -lm

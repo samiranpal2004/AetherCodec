@@ -1,0 +1,1 @@
+/usr/bin/cc  -Wall -Wextra -O2 -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/aether_receiver.dir/link.d CMakeFiles/aether_receiver.dir/daemon/aether_receiver.c.o -o aether_receiver  libaether_os.a libaether_codec.a libaether_runtime.a -lpipewire-0.3 libaether_transport.a -lbluetooth -lfftw3f -lm

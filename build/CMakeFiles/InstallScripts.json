@@ -1,0 +1,10 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/sudipta/D_drive/aethercodec/build/cmake_install.cmake",
+		"/home/sudipta/D_drive/aethercodec/build/src/cmake_install.cmake",
+		"/home/sudipta/D_drive/aethercodec/build/tools/cmake_install.cmake",
+		"/home/sudipta/D_drive/aethercodec/build/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
