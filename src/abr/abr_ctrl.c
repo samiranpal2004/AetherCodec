@@ -12,6 +12,7 @@ struct ABRCtrl {
     ABRState     min_state;        /* best (numerically lowest) state allowed;
                                       raised by congestion, relaxed over time */
     uint64_t     relax_ms;         /* next time min_state may relax one step */
+    int          headroom;         /* sender reports real spare capacity */
     ABRCallback  callback;
     void        *userdata;
 };
@@ -34,6 +35,23 @@ int abr_state_rate(ABRState s) {
     return (s == ABR_STATE_NL_96K || s == ABR_STATE_HQ_96K) ? 96000 : 48000;
 }
 
+float abr_smr_step(float smr_db, int queue_ms, int dropped) {
+    if (dropped || queue_ms > ABR_QUEUE_HIGH_MS) {
+        /* Decrease scaled by how far behind we are: a queue merely creeping up
+           gets a nudge, one that is nearly full gets cut hard. Proportional
+           rather than fixed-step so recovery from a sudden dense passage takes
+           a couple of ticks instead of ten. */
+        float cut = 1.0f + (float)queue_ms / 100.0f;
+        if (cut > 6.0f) cut = 6.0f;
+        smr_db -= cut;
+    } else if (queue_ms < ABR_QUEUE_LOW_MS) {
+        smr_db += ABR_SMR_UP_DB;
+    }
+    if (smr_db < ABR_SMR_MIN_DB) smr_db = ABR_SMR_MIN_DB;
+    if (smr_db > ABR_SMR_MAX_DB) smr_db = ABR_SMR_MAX_DB;
+    return smr_db;
+}
+
 ABRState abr_classify(int rssi_dbm, float loss_pct) {
     if (rssi_dbm > -65 && loss_pct < 1.0f) return ABR_STATE_NL_96K;
     if (rssi_dbm > -75 && loss_pct < 3.0f) return ABR_STATE_NL_48K;
@@ -47,7 +65,12 @@ ABRCtrl* abr_ctrl_create(ABRCallback cb, void *userdata) {
     abr->current  = ABR_STATE_NL_96K;   /* start optimistic, degrade on evidence */
     abr->callback = cb;
     abr->userdata = userdata;
+    abr->headroom = 1;                  /* assume spare capacity until told otherwise */
     return abr;
+}
+
+void abr_set_headroom(ABRCtrl *abr, int headroom) {
+    if (abr) abr->headroom = headroom ? 1 : 0;
 }
 
 ABRState abr_current_state(const ABRCtrl *abr) { return abr->current; }
@@ -100,8 +123,14 @@ void abr_update(ABRCtrl *abr, int rssi_dbm, float loss_pct, int jitter_level_ms)
 void abr_update_congested(ABRCtrl *abr, int rssi_dbm, float loss_pct,
                           int congested, uint64_t now_ms) {
     /* Relax the congestion ceiling one step at a time so a link that recovers
-       can climb back up. */
-    if (abr->min_state > ABR_STATE_NL_96K && now_ms >= abr->relax_ms) {
+       can climb back up — but only when the sender reports real spare capacity.
+       Relaxing purely on the timer means re-probing a mode the link has already
+       proven it cannot carry, every ABR_PROBE_INTERVAL_MS, forever; each probe
+       fills the send queue and costs an audible blip before it backs off again.
+       `headroom` defaults to 1, so a caller that never sets it keeps the plain
+       timer behaviour. */
+    if (abr->min_state > ABR_STATE_NL_96K && now_ms >= abr->relax_ms &&
+        abr->headroom && !congested) {
         abr->min_state--;
         abr->relax_ms = now_ms + ABR_PROBE_INTERVAL_MS;
     }

@@ -60,6 +60,10 @@ sources get added to the matching `src/CMakeLists.txt` target as each phase land
 **NL payload format** (self-describing, not fixed-size): `[frame_samples:u16]`
 then per channel `[order:u8][rice_k:u8][coeffs:order·i32][warmup:order·i32][rice_len:u16][rice_bytes]`.
 
+**HQ payload format**: `[frame_samples:u16]` then per channel
+`[band_mask:u64][sf_rice_k:u8][sf_len:u16][sf_bytes][cf_rice_k:u8][cf_len:u16][cf_bytes]`
+— scalefactors and coefficients cover only the bands set in the mask.
+
 ## Intentional divergences from the spec docs
 
 The provided docs contain a few inconsistencies we corrected in code. Keep these —
@@ -80,10 +84,18 @@ don't "fix" them back to match the prose:
 - Bark bands normalise by the Bark value **at Nyquist**, not a fixed 24 (at 96kHz
   a fixed 24 dumps ~2/3 of the spectrum into the last band); ATH dB is clamped
   before `powf` (the raw formula hits ~5300 dB at 48kHz and overflows).
-- `MDCT_SMR_DB = 30`, not 12 — the rate/quality knob. 12 dB yields ~13 dB SNR at
-  ~490 kbps, under half the 900–1,100 kbps HQ budget.
+- SMR defaults to **30 dB**, not the doc's 12 — the rate/quality knob (~6 dB per
+  bit per significant coefficient). It is a *runtime* value (`mdct_set_smr_db`),
+  not a constant: a fixed quality means an uncontrolled bitrate, and the sender
+  closes an AIMD loop on it (`abr_smr_step`) so HQ fits whatever the link
+  actually carries. Dropped frames are far more audible than coarse quantisation.
 - HQ entropy stage is **Rice, not Huffman** — the HLD's "fixed tables v1.0" are
   never specified anywhere, so untrained tables would be arbitrary.
+- **HQ payload carries a 64-bit band mask** (not in the HLD): Rice never codes a
+  symbol in zero bits, so the ~63% of 96 kHz bins that the ATH correctly zeroes
+  still cost a bit each. That floored HQ-96k near 500 kbps whatever the quantiser
+  did. Skipping dead bands costs 8 bytes/channel/frame and roughly halves the
+  rate at identical SNR.
 
 - **The virtual sink lives on the SENDER**, not the receiver (Step 4.1 says B,
   Step 4.4 contradicts it with A; only A works for the stated goal). Receiver is
@@ -104,7 +116,14 @@ don't "fix" them back to match the prose:
 - **Sender decouples encode from send** (bounded packet queue + send thread):
   `rfcomm_send_packet` blocks, and blocking the encode loop on big NL frames
   drops captured audio and makes delivery bursty (stutter). Don't reintroduce a
-  direct send from the encode loop.
+  direct send from the encode loop. The queue is bounded by **queued audio time**
+  (`SENDQ_MAX_MS`), never by slot count — a 2048-sample NL frame and a
+  512-sample HQ frame are 4x apart in duration, so counting slots silently gives
+  HQ a quarter of the slack.
+- **Don't hand-chunk sends at `AETHER_RFCOMM_MTU`.** BlueZ's
+  `rfcomm_sock_sendmsg` already fragments at the negotiated DLC MTU; pre-splitting
+  only forces extra RFCOMM frames. One `send()` per packet, looping only on short
+  writes.
 - **ABR also reacts to send-queue backpressure**, not just RSSI (`abr_update_congested`):
   a strong link can still be unable to carry NL-96k. Congestion drops a rung
   immediately and holds a ceiling for `ABR_PROBE_INTERVAL_MS` to avoid oscillation.

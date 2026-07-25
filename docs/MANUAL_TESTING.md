@@ -164,14 +164,29 @@ cover it.
 
 | Signal    | SNR full | SNR audible | Bitrate   |
 |-----------|----------|-------------|-----------|
-| tonal     | ~27.5 dB | ~27.5 dB    | ~540 kbps |
-| broadband | ~13 dB   | ~27.6 dB    | ~1050 kbps |
+| tonal     | ~27.5 dB | ~27.5 dB    | ~180 kbps |
+| broadband | ~13 dB   | ~27.6 dB    | ~595 kbps |
+
+Plus an SMR sweep proving the rate knob works:
+
+| SMR | Bitrate | Audible SNR |
+|-----|---------|-------------|
+| 30 dB (default) | ~595 kbps | ~27.6 dB |
+| 24 dB | ~526 kbps | ~21.3 dB |
+| 18 dB | ~374 kbps | ~16.3 dB |
+| 12 dB (controller floor) | ~294 kbps | ~11.7 dB |
+| 6 dB (codec floor) | ~198 kbps | ~1.7 dB — noise, never used |
 
 How to read this:
 
 - **Bitrate is content-adaptive.** Sparse tonal material needs far fewer bits
-  than dense broadband material. Broadband (~1050 kbps) is the realistic worst
-  case and lands inside the PRD's **900–1,100 kbps** HQ target.
+  than dense broadband material; broadband is the realistic worst case. These
+  numbers are roughly half what they were before HQ gained its **band mask**:
+  Rice never codes a symbol in zero bits, so the ~63% of 96 kHz bins the ATH
+  correctly zeroes still cost a bit each, flooring HQ-96k near 500 kbps whatever
+  the quantiser did. Skipping dead bands costs 8 bytes/channel/frame and halves
+  the rate at *identical* SNR — which is why broadband now lands under the PRD's
+  900–1,100 kbps target rather than at the top of it.
 - **Two SNRs are reported on purpose.** At 96 kHz the spectrum runs to 48 kHz,
   but the absolute threshold of hearing correctly quantises everything above
   ~17.6 kHz to zero. That discarded ultrasonic content is what drags *full-band*
@@ -183,15 +198,20 @@ How to read this:
 
 ### 5.3 Tuning quality vs bitrate
 
-The single knob is `MDCT_SMR_DB` in `src/encoder/codec_mdct_enc.c`
-(signal-to-mask ratio, currently **30 dB**). Roughly **6 dB ≈ 1 bit** per
-significant coefficient:
+The single knob is the signal-to-mask ratio, **default 30 dB**, roughly
+**6 dB ≈ 1 bit** per significant coefficient. It is a runtime value
+(`mdct_set_smr_db`), not a compile-time constant:
 
-- **Lower** it (e.g. 24) → smaller packets, lower SNR.
-- **Raise** it (e.g. 36) → better SNR, higher bitrate.
+- **Lower** it → smaller packets, lower SNR.
+- **Raise** it → better SNR, higher bitrate (capped at 30 dB).
 
-Rebuild and re-run `test_codec_hq` to see the new operating point. The doc's
-suggested 12 dB gives only ~13 dB SNR at ~490 kbps — under half the HQ budget.
+**The sender drives it automatically.** A fixed quality means an uncontrolled
+bitrate — on a real link HQ-96k drifted from 440 to 860 kbps as the music got
+denser, overran the link and dropped ~20% of frames. `abr_smr_step()` closes an
+AIMD loop against send-queue depth: quality eases up while the queue drains,
+backs off in proportion to how far behind it gets. That is what makes fixed
+`--mode hq` smooth without needing `auto`. Watch it live in the sender's
+`smr=NNdB` field. `test_abr` proves it converges on 900 / 520 / 300 kbps links.
 
 ---
 
@@ -288,12 +308,18 @@ pw-play --target aether_codec_sink your_music.flac
 > count means that mode is over budget, and the sender says so once in plain
 > English.
 >
+> **Read `link=` , not `rfcomm_bench`.** The sender now reports the throughput
+> the air interface is *actually* sustaining. On the reference pair a short
+> `rfcomm_bench` burst read 1,003 kbps while a sustained stream carried only
+> ~525 kbps — the bench is a best case, and 2.4 GHz Wi-Fi coexistence on either
+> laptop roughly halves it. Size your expectations off `link=`.
+>
 > **NL-96k on a ~1 Mbps link will never be smooth.** Measured on real music it
 > needs **~3,100 kbps**, not the PRD's ~1,400: LPC gets about 1.5× on 24-bit
 > material, because the low bits of a 24-bit master are noise and Rice coding
-> cannot compress noise. Compare against your §9.2 `rfcomm_bench` number before
-> concluding anything is broken — if the ceiling is ~1,000 kbps, the modes that
-> actually fit are HQ-96k (~750 kbps) and HQ-48k (~500 kbps).
+> cannot compress noise. NL is lossless, so there is no quality to trade away —
+> the bitrate is whatever the music needs. HQ has a rate controller and will fit
+> the link; NL cannot. That is the one honest limit here.
 >
 > Note also that the receiver's `lost=` counter is **not** on-air loss — RFCOMM
 > is a reliable stream. It counts gaps in the sequence, which in practice means

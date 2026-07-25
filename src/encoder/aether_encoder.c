@@ -17,8 +17,9 @@
    Perceptual HQ (mode 1):
      [frame_samples : u16]   (== MDCT_HOP)
      per channel:
-       [sf_rice_k : u8][sf_len : u16][sf_bytes]    Rice-coded scalefactor deltas
-       [cf_rice_k : u8][cf_len : u16][cf_bytes]    Rice-coded quantised coeffs
+       [band_mask : u64 LE]                        bit b set = band b is coded
+       [sf_rice_k : u8][sf_len : u16][sf_bytes]    scalefactor deltas, coded bands
+       [cf_rice_k : u8][cf_len : u16][cf_bytes]    quantised coeffs, coded bands
 
    Both are self-describing given the packet header (mode, channels).
 
@@ -26,7 +27,16 @@
    docs never specify those tables and untrained ones would be arbitrary. The
    already-proven Rice coder is used instead — it is adaptive per frame, needs
    no shipped tables, and suits the near-Laplacian distribution of quantised
-   MDCT coefficients. */
+   MDCT coefficients.
+
+   The band mask is not in the HLD. It is needed because Rice never codes a
+   symbol in zero bits: a quantised-to-zero coefficient still costs the unary
+   terminator. At 96 kHz the absolute threshold of hearing correctly zeroes
+   everything above ~17.6 kHz — roughly 63% of the 512 bins — so those dead bins
+   put a hard ~500 kbps floor under HQ-96k that coarsening the quantiser could
+   not get below, which is more than a real RFCOMM link was carrying. Skipping
+   them costs 8 bytes per channel per frame and cut the measured broadband rate
+   from ~1050 to ~595 kbps at identical SNR. */
 
 struct AetherEncoder {
     int      mode;
@@ -95,45 +105,69 @@ static int encode_channel_hq(uint8_t *p, int remaining, const float *win_buf) {
     mdct_masking_threshold(coeffs, mask);
     mdct_band_steps(mask, step);
 
-    int32_t sf_delta[BARK_BANDS];
-    int32_t q[MDCT_COEFFS];
-    int prev_sf = 0;
+    int32_t  q[MDCT_COEFFS];
+    int32_t  sf_all[BARK_BANDS];
+    uint64_t band_mask = 0;
 
     for (int b = 0; b < BARK_BANDS; b++) {
         int   sf = mdct_step_to_sf(step[b]);
         /* Quantise with the *reconstructed* step so the decoder matches bit for
            bit; using the unrounded step would desynchronise the two sides. */
         float s  = mdct_sf_to_step(sf);
-        sf_delta[b] = sf - prev_sf;
-        prev_sf = sf;
+        sf_all[b] = sf;
 
+        int nz = 0;
         for (int k = mdct_band_start(b); k < mdct_band_start(b + 1); k++) {
             float v = coeffs[k] / s;
             if (v >  8388607.0f) v =  8388607.0f;
             if (v < -8388608.0f) v = -8388608.0f;
             q[k] = (int32_t)lrintf(v);
+            if (q[k]) nz = 1;
         }
+        if (nz) band_mask |= (uint64_t)1 << b;
     }
 
-    int sfk = rice_select_param(sf_delta, BARK_BANDS);
-    int cfk = rice_select_param(q, MDCT_COEFFS);
+    /* Send only the bands that survived quantisation.
+
+       A zero coefficient is not free in Rice: at k=0 it still costs the unary
+       terminator bit, and more at higher k. At 96 kHz the absolute threshold
+       correctly zeroes everything above ~17.6 kHz — about 63% of the 512 bins —
+       so those dead bins alone put a hard ~500 kbps floor under HQ-96k that no
+       amount of coarsening could get below. A 64-bit band mask costs 8 bytes and
+       removes both the dead coefficients and their scalefactors; the delta chain
+       simply runs over the coded bands instead of all of them. */
+    int32_t sf_delta[BARK_BANDS];
+    int32_t qc[MDCT_COEFFS];
+    int nsf = 0, nq = 0, prev_sf = 0;
+    for (int b = 0; b < BARK_BANDS; b++) {
+        if (!((band_mask >> b) & 1)) continue;
+        sf_delta[nsf++] = sf_all[b] - prev_sf;
+        prev_sf = sf_all[b];
+        for (int k = mdct_band_start(b); k < mdct_band_start(b + 1); k++)
+            qc[nq++] = q[k];
+    }
 
     uint8_t *start = p;
-    if (remaining < 6) return -1;
+    if (remaining < 8 + 3 + 3) return -1;
 
-    /* scalefactor block */
+    /* band mask, little-endian */
+    for (int i = 0; i < 8; i++) *p++ = (uint8_t)(band_mask >> (8 * i));
+
+    /* scalefactor block (coded bands only) */
+    int sfk = rice_select_param(sf_delta, nsf);
     *p++ = (uint8_t)sfk;
     int cap = remaining - (int)(p - start) - 2;
-    int sfbytes = rice_encode(sf_delta, BARK_BANDS, sfk, p + 2, cap);
+    int sfbytes = rice_encode(sf_delta, nsf, sfk, p + 2, cap);
     if (sfbytes < 0) return -1;
     uint16_t sl = (uint16_t)sfbytes;
     memcpy(p, &sl, 2); p += 2 + sfbytes;
 
-    /* coefficient block */
+    /* coefficient block (coded bands only) */
     if (remaining - (int)(p - start) < 3) return -1;
+    int cfk = rice_select_param(qc, nq);
     *p++ = (uint8_t)cfk;
     cap = remaining - (int)(p - start) - 2;
-    int cfbytes = rice_encode(q, MDCT_COEFFS, cfk, p + 2, cap);
+    int cfbytes = rice_encode(qc, nq, cfk, p + 2, cap);
     if (cfbytes < 0) return -1;
     uint16_t cl = (uint16_t)cfbytes;
     memcpy(p, &cl, 2); p += 2 + cfbytes;

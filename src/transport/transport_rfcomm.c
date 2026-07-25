@@ -11,6 +11,7 @@
 struct RFCOMMTransport {
     int server_fd;   // listening socket (-1 for client)
     int conn_fd;     // active connection socket
+    unsigned long tx_bytes;   // bytes accepted by the socket, for throughput
     uint8_t tx_buf[AETHER_HEADER_SIZE + AETHER_MAX_PAYLOAD + 4 + 16];
     uint8_t rx_buf[AETHER_HEADER_SIZE + AETHER_MAX_PAYLOAD + 4 + 16];
 };
@@ -76,15 +77,27 @@ int rfcomm_send_packet(RFCOMMTransport *t, const AetherPacket *pkt) {
     int n = aether_packet_pack(pkt, t->tx_buf, sizeof(t->tx_buf));
     if (n < 0) return -1;
 
-    /* Send in chunks respecting RFCOMM MTU */
+    /* One send() for the whole packet. Hand-chunking at a hardcoded 672 was
+       counterproductive: BlueZ's rfcomm_sock_sendmsg already fragments at the
+       *negotiated* DLC MTU, so pre-splitting only forces extra RFCOMM frames
+       whenever that MTU is larger than our guess. The loop below exists solely
+       to handle a short write on a stream socket. */
     int sent = 0;
     while (sent < n) {
-        int chunk = (n - sent < AETHER_RFCOMM_MTU) ? n - sent : AETHER_RFCOMM_MTU;
-        int r = send(t->conn_fd, t->tx_buf + sent, chunk, 0);
-        if (r < 0) { perror("send"); return -1; }
+        int r = (int)send(t->conn_fd, t->tx_buf + sent, (size_t)(n - sent), 0);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            perror("send");
+            return -1;
+        }
         sent += r;
     }
+    t->tx_bytes += (unsigned long)n;
     return 0;
+}
+
+unsigned long rfcomm_tx_bytes(const RFCOMMTransport *t) {
+    return t ? t->tx_bytes : 0;
 }
 
 int rfcomm_recv_packet(RFCOMMTransport *t, AetherPacket *pkt_out) {

@@ -17,14 +17,33 @@
 
 /* Signal-to-mask ratio — the operating point of the whole HQ mode.
    The masking threshold is placed SMR dB below the spread masker energy, so
-   this constant is effectively the rate/quality control: each 6 dB costs about
-   1 bit per significant coefficient.
+   this is the rate/quality control: each 6 dB costs about 1 bit per significant
+   coefficient.
    The HLD suggests ~12 dB, but that yields only ~13 dB SNR at ~490 kbps —
-   barely half the PRD's 900-1,100 kbps HQ budget, i.e. it discards quality the
-   Bluetooth link can comfortably carry. 30 dB puts the measured bitrate inside
-   the target band (see tests/test_codec_hq.c). */
-#define MDCT_SMR_DB     30.0f
-#define MDCT_SMR_LINEAR 1.0e-3f    /* 10^(-30/10) */
+   barely half the PRD's 900-1,100 kbps HQ budget. 30 dB is the default and puts
+   the measured bitrate inside the target band (see tests/test_codec_hq.c).
+
+   It is a *runtime* value, not a compile-time constant, because a fixed SMR
+   means a fixed quality and therefore an uncontrolled bitrate: on a link that
+   cannot carry what the content happens to need, the sender's queue backs up
+   and frames get dropped, which is far more audible than the coarser
+   quantisation that would have avoided it. The sender closes the loop on this
+   (see aether_sender.c). Process-global like the rest of this module's tables. */
+#define MDCT_SMR_DEFAULT_DB 30.0f
+#define MDCT_SMR_MIN_DB      6.0f
+#define MDCT_SMR_MAX_DB     30.0f
+
+static float smr_db     = MDCT_SMR_DEFAULT_DB;
+static float smr_linear = 1.0e-3f;         /* 10^(-30/10) */
+
+void mdct_set_smr_db(float db) {
+    if (db < MDCT_SMR_MIN_DB) db = MDCT_SMR_MIN_DB;
+    if (db > MDCT_SMR_MAX_DB) db = MDCT_SMR_MAX_DB;
+    smr_db     = db;
+    smr_linear = powf(10.0f, -db / 10.0f);
+}
+
+float mdct_get_smr_db(void) { return smr_db; }
 
 static float kbd_window[MDCT_SIZE];
 static int   bark_of_bin[MDCT_COEFFS];
@@ -219,7 +238,7 @@ void mdct_masking_threshold(const float *coeffs, float *mask_out) {
                                     : powf(10.0f, ( 6.0f * dz) / 10.0f);
             spread += band_energy[i] * sf;
         }
-        mask_out[j] = spread * MDCT_SMR_LINEAR;
+        mask_out[j] = spread * smr_linear;
         if (mask_out[j] < ath_energy[j]) mask_out[j] = ath_energy[j];
     }
 }

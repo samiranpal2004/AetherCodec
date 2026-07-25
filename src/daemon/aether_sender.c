@@ -56,11 +56,24 @@
 #define SENDQ_MAX_MS    500   /* drop the oldest beyond this much queued audio */
 #define SENDQ_HIGH_MS   200   /* above this the link is treated as congested   */
 
+/* How often the HQ rate controller runs. The controller itself is
+   abr_smr_step() — see abr_ctrl.h for why HQ needs one at all. It runs on the
+   encode thread, which is also the thread that reads the psychoacoustic state,
+   so no locking is needed. */
+#define RATE_TICK_MS      250
+
 static volatile sig_atomic_t running = 1;
 static void on_sigint(int sig) { (void)sig; running = 0; }
 
 /* Set by the ABR thread, consumed by the encode loop at a frame boundary. */
 static _Atomic int pending_state = -1;
+
+/* Set by the encode loop's rate controller, read by the ABR thread: the link is
+   keeping up AND the encoder has no quality left to spend, i.e. there is real
+   spare capacity. Without this, ABR relaxes its congestion ceiling purely on a
+   timer and re-probes a mode the link demonstrably cannot carry every 20 s —
+   each probe being an audible blip. */
+static _Atomic int link_headroom = 0;
 
 /* ---- send queue --------------------------------------------------------- */
 
@@ -234,6 +247,7 @@ static void *abr_thread(void *arg) {
         }
 
         ABRState before = abr_current_state(g_abr);
+        abr_set_headroom(g_abr, atomic_load(&link_headroom));
         abr_update_congested(g_abr, rssi, 0.0f, congested,
                              aether_timestamp_us() / 1000ULL);
         ABRState after = abr_current_state(g_abr);
@@ -373,6 +387,13 @@ int main(int argc, char *argv[]) {
     uint64_t      seg_start_us = aether_timestamp_us();
     int           over_budget_warned = 0;
 
+    /* HQ rate controller + link-throughput measurement state. */
+    uint64_t      rate_last_us    = seg_start_us;
+    unsigned long rate_last_drop  = 0;
+    unsigned long link_last_bytes = 0;
+    uint64_t      link_last_us    = seg_start_us;
+    double        link_kbps       = 0.0;
+
     while (running) {
         int ps = atomic_exchange(&pending_state, -1);
         if (ps >= 0) {
@@ -389,6 +410,39 @@ int main(int argc, char *argv[]) {
                 if (dec) aether_decoder_flush(dec);
                 seg_frames = 0; seg_bytes = 0;
                 seg_start_us = aether_timestamp_us();
+            }
+        }
+
+        /* ---- rate control tick (encode thread, so touching the encoder's
+               psychoacoustic state here is safe) ---------------------------- */
+        if (!loopback) {
+            uint64_t now_us = aether_timestamp_us();
+            if (now_us - rate_last_us >= RATE_TICK_MS * 1000ULL) {
+                int depth = sendq_depth_ms(&g_sendq);
+                unsigned long drops = sendq_dropped(&g_sendq);
+                int behind = (drops > rate_last_drop);
+                rate_last_drop = drops;
+
+                if (mode == AETHER_MODE_HQ)
+                    mdct_set_smr_db(abr_smr_step(mdct_get_smr_db(), depth, behind));
+
+                /* Real spare capacity: queue empty and nothing left to spend it
+                   on. In NL there is no quality knob, so the queue alone says it. */
+                atomic_store(&link_headroom,
+                             depth < ABR_QUEUE_LOW_MS &&
+                             (mode == AETHER_MODE_NL ||
+                              mdct_get_smr_db() >= ABR_SMR_MAX_DB - 0.01f));
+
+                /* Sustained link throughput: send() blocks once the kernel
+                   buffer is full, so this is what the air interface really
+                   carried — not what we hoped to push. */
+                unsigned long tx = rfcomm_tx_bytes(t);
+                double secs = (now_us - link_last_us) / 1e6;
+                if (secs > 0.0)
+                    link_kbps = (tx - link_last_bytes) * 8.0 / 1000.0 / secs;
+                link_last_bytes = tx;
+                link_last_us    = now_us;
+                rate_last_us    = now_us;
             }
         }
 
@@ -442,11 +496,15 @@ int main(int argc, char *argv[]) {
                 printf("[stats] frames=%lu  %.1fs  %.0f kbps  mode=%s rate=%d\n",
                        frames, wall_s, kbps,
                        mode == AETHER_MODE_NL ? "NL" : "HQ", rate);
+            else if (mode == AETHER_MODE_HQ)
+                printf("[stats] frames=%lu  %.1fs  %.0f kbps  mode=HQ rate=%d  "
+                       "smr=%.0fdB link=%.0f kbps  queue=%dms dropped=%lu\n",
+                       frames, wall_s, kbps, rate, mdct_get_smr_db(), link_kbps,
+                       sendq_depth_ms(&g_sendq), sendq_dropped(&g_sendq));
             else
-                printf("[stats] frames=%lu  %.1fs  %.0f kbps  mode=%s rate=%d  "
-                       "queue=%dms dropped=%lu\n",
-                       frames, wall_s, kbps,
-                       mode == AETHER_MODE_NL ? "NL" : "HQ", rate,
+                printf("[stats] frames=%lu  %.1fs  %.0f kbps  mode=NL rate=%d  "
+                       "link=%.0f kbps  queue=%dms dropped=%lu\n",
+                       frames, wall_s, kbps, rate, link_kbps,
                        sendq_depth_ms(&g_sendq), sendq_dropped(&g_sendq));
             fflush(stdout);
 
@@ -455,17 +513,28 @@ int main(int argc, char *argv[]) {
                letting the user chase a phantom bug. NL-96k on real 24-bit music
                compresses to ~2.5-3 Mbps (LPC gets ~1.5x, not the PRD's assumed
                3.3x), which is well past what RFCOMM/EDR carries. */
-            if (!loopback && !auto_mode && !over_budget_warned &&
+            if (!loopback && !over_budget_warned &&
                 sendq_dropped(&g_sendq) > 100) {
                 over_budget_warned = 1;
-                fprintf(stderr,
-                    "[sender] WARNING: %s-%dk needs ~%.0f kbps but the link "
-                    "cannot carry it — frames are being dropped and playback "
-                    "will glitch.\n"
-                    "         Use --mode auto (picks the best mode the link "
-                    "sustains) or --mode hq.\n"
-                    "         Compare with ./tools/rfcomm_bench.\n",
-                    mode == AETHER_MODE_NL ? "NL" : "HQ", rate / 1000, kbps);
+                if (mode == AETHER_MODE_NL)
+                    fprintf(stderr,
+                        "[sender] WARNING: NL-%dk needs ~%.0f kbps but the link "
+                        "is only carrying ~%.0f kbps — frames are being dropped "
+                        "and playback will glitch.\n"
+                        "         NL is lossless, so there is no quality knob to "
+                        "trade away; the bitrate is whatever the music needs.\n"
+                        "         Use --mode hq (rate-controlled, adapts to the "
+                        "link) or --mode auto.\n",
+                        rate / 1000, kbps, link_kbps);
+                else
+                    fprintf(stderr,
+                        "[sender] WARNING: HQ-%dk is at the minimum quality "
+                        "(SMR %.0f dB, ~%.0f kbps) and the link is still only "
+                        "carrying ~%.0f kbps.\n"
+                        "         The rate controller has nothing left to give. "
+                        "Check ./tools/rfcomm_bench and for 2.4 GHz Wi-Fi "
+                        "interference on either laptop.\n",
+                        rate / 1000, mdct_get_smr_db(), kbps, link_kbps);
             }
         }
     }

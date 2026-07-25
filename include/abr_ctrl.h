@@ -37,6 +37,34 @@ typedef enum {
    retrying it (each retry is an audible blip). */
 #define ABR_PROBE_INTERVAL_MS     20000
 
+/* ---- HQ rate control ----------------------------------------------------
+   The four-rung ladder above is coarse: each step roughly halves the demand.
+   Within a rung, HQ's bitrate is whatever the content happens to need at a
+   fixed quality, which on a real link drifted from ~440 to ~860 kbps as the
+   music got denser, overran the link and dropped ~20% of frames. A dropped
+   frame is a hole in the audio; coarser quantisation is not. So HQ closes a
+   loop on its signal-to-mask ratio.
+
+   AIMD against send-queue depth: ease quality up while the queue drains
+   freely, back off in proportion to how far behind it is. Pure function so the
+   convergence behaviour is testable without a Bluetooth link. */
+#define ABR_QUEUE_LOW_MS    40   /* below this there is room to spend more bits */
+#define ABR_QUEUE_HIGH_MS   90   /* above this we are already behind            */
+#define ABR_SMR_UP_DB      0.4f  /* additive increase — deliberately gentle     */
+#define ABR_SMR_MAX_DB    30.0f
+/* The codec allows down to 6 dB, but measured audible SNR there is ~2 dB —
+   noise, and worse than the dropouts it would be avoiding. 12 dB (~12 dB SNR)
+   is the floor worth having. Below it the right move is not to keep crushing
+   the quantiser but to halve the sample rate, which buys the same bitrate back
+   at full quality — so the controller stops here and lets the ladder take the
+   step. In fixed --mode hq there is no ladder, and the sender warns instead. */
+#define ABR_SMR_MIN_DB    12.0f
+
+/* One control tick. `queue_ms` is the sender's queued audio depth and
+   `dropped` is non-zero if any frame was dropped since the previous tick.
+   Returns the new SMR, clamped to [ABR_SMR_MIN_DB, ABR_SMR_MAX_DB]. */
+float abr_smr_step(float smr_db, int queue_ms, int dropped);
+
 typedef struct ABRCtrl ABRCtrl;
 
 /* Fired when the engine commits to a new operating point. */
@@ -62,6 +90,13 @@ void abr_update_at(ABRCtrl *abr, int rssi_dbm, float packet_loss_pct,
    path the sender daemon uses; RSSI/loss still apply on top. */
 void abr_update_congested(ABRCtrl *abr, int rssi_dbm, float packet_loss_pct,
                           int congested, uint64_t now_ms);
+
+/* Report whether the sender currently has genuine spare capacity: its send
+   queue is draining freely AND the encoder has no quality left to spend on the
+   current rung. The congestion ceiling only relaxes while this holds, so `auto`
+   settles on a mode that fits instead of re-probing an impossible one on a
+   timer forever. Defaults to 1 (plain timer relax) if never called. */
+void abr_set_headroom(ABRCtrl *abr, int headroom);
 
 /* Pure classification of a link condition — no hysteresis, no state. */
 ABRState abr_classify(int rssi_dbm, float packet_loss_pct);

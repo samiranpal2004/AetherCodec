@@ -22,4 +22,10 @@ int  rfcomm_recv_packet(RFCOMMTransport *t, AetherPacket *pkt_out);
 /* Get raw socket fd (for select/poll) */
 int  rfcomm_get_fd(const RFCOMMTransport *t);
 
+/* Total bytes handed to the socket and accepted by it. send() blocks once the
+   kernel's RFCOMM buffer is full, so the rate of change of this counter is the
+   link's actual sustained throughput — which is the number that matters, and in
+   practice runs well below a short rfcomm_bench burst. */
+unsigned long rfcomm_tx_bytes(const RFCOMMTransport *t);
+
 #endif /* TRANSPORT_RFCOMM_H */
