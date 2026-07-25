@@ -8,18 +8,43 @@
 /* Payload layouts.
 
    Near-Lossless (mode 0):
-     [frame_samples : u16]
-     per channel:
-       [order : u8][rice_k : u8]
+     [frame_samples : u16][flags : u8]
+       flags bit0: 1 = channels are mid/side, 0 = left/right (mono: always 0)
+     per coded channel:
+       [order : u8][rice_k : u8][wasted : u8]
        [coeffs : order * i32][warmup : order * i32]
        [rice_len : u16][rice_bytes : rice_len]
 
+     `wasted` is the count of low-order zero bits shared by every sample in the
+     channel (FLAC's "wasted bits"). Many 24-bit masters are 16-20 real bits
+     padded with zeros; shifting them out before LPC removes 4-8 bits/sample
+     from every residual at exactly zero cost to losslessness.
+
+     Mid/side is the lossless integer pair m=(l+r)>>1, s=l-r (the parity of s
+     recovers the bit dropped by the shift). It is chosen per frame by a bit
+     estimate — correlated stereo drops 10-30%, hard-panned or uncorrelated
+     material simply stays L/R, so it can never lose.
+
    Perceptual HQ (mode 1):
-     [frame_samples : u16]   (== MDCT_HOP)
-     per channel:
-       [band_mask : u64 LE]                        bit b set = band b is coded
-       [sf_rice_k : u8][sf_len : u16][sf_bytes]    scalefactor deltas, coded bands
-       [cf_rice_k : u8][cf_len : u16][cf_bytes]    quantised coeffs, coded bands
+     [frame_samples : u16]   (total samples: 1..4 hops, multiple of MDCT_HOP)
+     per hop:
+       [flags : u8]          bit0: 1 = coefficients are mid/side
+       per coded channel:
+         [band_mask : u64 LE]                        bit b set = band b is coded
+         [sf_rice_k : u8][sf_len : u16][sf_bytes]    scalefactor deltas, coded bands
+         [cf_rice_k : u8][cf_len : u16][cf_bytes]    quantised coeffs, coded bands
+
+     Batching several hops into one packet exists because HQ at one hop per
+     packet sends 187 packets/s at 96 kHz; each carries 24 bytes of header+CRC,
+     ~36 kbps of pure overhead — 15%+ of a weak link. Four hops per packet
+     (matching NL's 2048-sample duration) cuts that to ~9 kbps and quarters the
+     per-packet transport cost.
+
+     HQ mid/side is applied in the TRANSFORM domain (m=(L+R)/2, s=(L-R)/2 on
+     MDCT coefficients), not on samples: the transform is linear so the two are
+     equivalent, but transform-domain switching keeps the decoder's overlap-add
+     history in L/R space, so the per-frame decision can flip freely without
+     smearing representations across the window boundary.
 
    Both are self-describing given the packet header (mode, channels).
 
@@ -37,6 +62,8 @@
    not get below, which is more than a real RFCOMM link was carrying. Skipping
    them costs 8 bytes per channel per frame and cut the measured broadband rate
    from ~1050 to ~595 kbps at identical SNR. */
+
+#define AETHER_FLAG_MID_SIDE 0x01
 
 struct AetherEncoder {
     int      mode;
@@ -71,19 +98,42 @@ AetherEncoder* aether_encoder_create(int mode, int sample_rate,
 
 /* ---- Near-Lossless ------------------------------------------------------ */
 
+/* Low-order zero bits common to every sample: content mastered at fewer real
+   bits than the container carries (16-in-24 is common). 0 for silence. */
+static int nl_wasted_bits(const int32_t *x, int n) {
+    uint32_t acc = 0;
+    for (int i = 0; i < n; i++) acc |= (uint32_t)x[i];
+    if (acc == 0) return 0;
+    int w = __builtin_ctz(acc);
+    return w > 30 ? 30 : w;
+}
+
+/* Approximate Rice bit cost of a channel under a cheap fixed 2nd-order
+   predictor. Only used to CHOOSE between L/R and M/S — the real LPC then runs
+   on the winning pair — so the absolute value doesn't matter, only the
+   ordering, and both candidates are measured identically. */
+static double nl_est_cost(const int32_t *x, int n) {
+    double sum = 0.0;
+    for (int i = 2; i < n; i++)
+        sum += fabs((double)x[i] - 2.0 * x[i - 1] + x[i - 2]);
+    double mean = n > 2 ? sum / (n - 2) : 0.0;
+    return (double)n * (log2(mean + 1.0) + 1.6);
+}
+
 static int encode_channel_nl(uint8_t *p, int remaining,
-                             const int32_t *chan, int n) {
+                             const int32_t *chan, int n, int wasted) {
     LPCFrameHeader h = {0};
     int32_t res[LPC_FRAME_SIZE] = {0};
     lpc_encode_frame(chan, n, &h, res);
     int k = rice_select_param(res + h.order, n - h.order);
 
-    int fixed = 2 + h.order * 8 + 2;
+    int fixed = 3 + h.order * 8 + 2;
     if (remaining < fixed) return -1;
 
     uint8_t *start = p;
     *p++ = (uint8_t)h.order;
     *p++ = (uint8_t)k;
+    *p++ = (uint8_t)wasted;
     memcpy(p, h.coeffs, (size_t)h.order * 4); p += h.order * 4;
     memcpy(p, h.warmup, (size_t)h.order * 4); p += h.order * 4;
 
@@ -98,10 +148,10 @@ static int encode_channel_nl(uint8_t *p, int remaining,
 
 /* ---- Perceptual HQ ------------------------------------------------------ */
 
-/* win_buf: MDCT_SIZE already-windowed samples for this channel. */
-static int encode_channel_hq(uint8_t *p, int remaining, const float *win_buf) {
-    float coeffs[MDCT_COEFFS], mask[BARK_BANDS], step[BARK_BANDS];
-    mdct_forward(win_buf, coeffs);
+/* Entropy-code one channel's MDCT coefficients (already transformed, possibly
+   mid/side). */
+static int encode_channel_hq(uint8_t *p, int remaining, const float *coeffs) {
+    float mask[BARK_BANDS], step[BARK_BANDS];
     mdct_masking_threshold(coeffs, mask);
     mdct_band_steps(mask, step);
 
@@ -127,15 +177,8 @@ static int encode_channel_hq(uint8_t *p, int remaining, const float *win_buf) {
         if (nz) band_mask |= (uint64_t)1 << b;
     }
 
-    /* Send only the bands that survived quantisation.
-
-       A zero coefficient is not free in Rice: at k=0 it still costs the unary
-       terminator bit, and more at higher k. At 96 kHz the absolute threshold
-       correctly zeroes everything above ~17.6 kHz — about 63% of the 512 bins —
-       so those dead bins alone put a hard ~500 kbps floor under HQ-96k that no
-       amount of coarsening could get below. A 64-bit band mask costs 8 bytes and
-       removes both the dead coefficients and their scalefactors; the delta chain
-       simply runs over the coded bands instead of all of them. */
+    /* Send only the bands that survived quantisation (see the header comment
+       on the band mask). */
     int32_t sf_delta[BARK_BANDS];
     int32_t qc[MDCT_COEFFS];
     int nsf = 0, nq = 0, prev_sf = 0;
@@ -175,15 +218,75 @@ static int encode_channel_hq(uint8_t *p, int remaining, const float *win_buf) {
     return (int)(p - start);
 }
 
+/* Encode one MDCT hop (flags byte + per-channel blocks). `pcm` points at the
+   hop's interleaved samples. */
+static int encode_hq_hop(AetherEncoder *enc, uint8_t *p, int remaining,
+                         const int32_t *pcm) {
+    const float *w = mdct_window();
+    static float coef[2][MDCT_COEFFS];   /* single-threaded codec (see mdct.h) */
+
+    for (int c = 0; c < enc->channels; c++) {
+        float buf[MDCT_SIZE];
+        /* previous hop, then this hop */
+        memcpy(buf, enc->hist[c], MDCT_HOP * sizeof(float));
+        for (int i = 0; i < MDCT_HOP; i++) {
+            float s = (float)pcm[i * enc->channels + c];
+            buf[MDCT_HOP + i] = s;
+            enc->hist[c][i]   = s;
+        }
+        for (int n = 0; n < MDCT_SIZE; n++) buf[n] *= w[n];
+        mdct_forward(buf, coef[c]);
+    }
+
+    uint8_t flags = 0;
+    if (enc->channels == 2) {
+        /* Estimate Rice cost of both pairings from the mean |coefficient|,
+           using the energy-preserving rotation (1/sqrt2) for the estimate so
+           neither pairing gets a free scale advantage. */
+        double al = 0, ar = 0, am = 0, as2 = 0;
+        for (int k = 0; k < MDCT_COEFFS; k++) {
+            float l = coef[0][k], r = coef[1][k];
+            al  += fabsf(l);
+            ar  += fabsf(r);
+            am  += fabsf((l + r) * 0.70710678f);
+            as2 += fabsf((l - r) * 0.70710678f);
+        }
+        #define HQ_COST(x) log2((x) / MDCT_COEFFS + 1.0)
+        if (HQ_COST(am) + HQ_COST(as2) < HQ_COST(al) + HQ_COST(ar)) {
+            flags |= AETHER_FLAG_MID_SIDE;
+            for (int k = 0; k < MDCT_COEFFS; k++) {
+                float m = (coef[0][k] + coef[1][k]) * 0.5f;
+                float s = (coef[0][k] - coef[1][k]) * 0.5f;
+                coef[0][k] = m;
+                coef[1][k] = s;
+            }
+        }
+        #undef HQ_COST
+    }
+
+    uint8_t *start = p;
+    if (remaining < 1) return -1;
+    *p++ = flags; remaining--;
+
+    for (int c = 0; c < enc->channels; c++) {
+        int n = encode_channel_hq(p, remaining, coef[c]);
+        if (n < 0) return -1;
+        p += n; remaining -= n;
+    }
+    return (int)(p - start);
+}
+
 /* ---- Public API --------------------------------------------------------- */
 
 int aether_encoder_encode(AetherEncoder *enc, const int32_t *pcm,
                           int frame_samples, AetherPacket *pkt_out) {
     if (enc->channels != 1 && enc->channels != 2) return -1;
     if (frame_samples <= 0) return -1;
-    if (enc->mode == AETHER_MODE_NL  && frame_samples > LPC_FRAME_SIZE) return -1;
-    if (enc->mode == AETHER_MODE_HQ  && frame_samples != MDCT_HOP)      return -1;
-    if (enc->mode != AETHER_MODE_NL && enc->mode != AETHER_MODE_HQ)     return -1;
+    if (enc->mode == AETHER_MODE_NL && frame_samples > LPC_FRAME_SIZE) return -1;
+    if (enc->mode == AETHER_MODE_HQ &&
+        (frame_samples % MDCT_HOP != 0 || frame_samples > LPC_FRAME_SIZE))
+        return -1;
+    if (enc->mode != AETHER_MODE_NL && enc->mode != AETHER_MODE_HQ) return -1;
 
     memset(pkt_out, 0, sizeof(*pkt_out));
     pkt_out->hdr.magic        = AETHER_MAGIC;
@@ -201,28 +304,50 @@ int aether_encoder_encode(AetherEncoder *enc, const int32_t *pcm,
     memcpy(p, &fs, 2); p += 2; remaining -= 2;
 
     if (enc->mode == AETHER_MODE_NL) {
-        int32_t chan[LPC_FRAME_SIZE];
-        for (int c = 0; c < enc->channels; c++) {
+        static int32_t chan[2][LPC_FRAME_SIZE];   /* codec is single-threaded */
+        uint8_t flags = 0;
+
+        for (int c = 0; c < enc->channels; c++)
             for (int i = 0; i < frame_samples; i++)
-                chan[i] = pcm[i * enc->channels + c];
-            int n = encode_channel_nl(p, remaining, chan, frame_samples);
+                chan[c][i] = pcm[i * enc->channels + c];
+
+        if (enc->channels == 2) {
+            static int32_t mid[LPC_FRAME_SIZE], side[LPC_FRAME_SIZE];
+            for (int i = 0; i < frame_samples; i++) {
+                int32_t l = chan[0][i], r = chan[1][i];
+                mid[i]  = (l + r) >> 1;   /* arithmetic shift, floor */
+                side[i] = l - r;          /* parity of s recovers the lost bit */
+            }
+            double cost_lr = nl_est_cost(chan[0], frame_samples)
+                           + nl_est_cost(chan[1], frame_samples);
+            double cost_ms = nl_est_cost(mid,  frame_samples)
+                           + nl_est_cost(side, frame_samples);
+            if (cost_ms < cost_lr) {
+                flags |= AETHER_FLAG_MID_SIDE;
+                memcpy(chan[0], mid,  (size_t)frame_samples * 4);
+                memcpy(chan[1], side, (size_t)frame_samples * 4);
+            }
+        }
+
+        if (remaining < 1) return -1;
+        *p++ = flags; remaining--;
+
+        for (int c = 0; c < enc->channels; c++) {
+            int wasted = nl_wasted_bits(chan[c], frame_samples);
+            if (wasted) {
+                for (int i = 0; i < frame_samples; i++)
+                    chan[c][i] >>= wasted;
+            }
+            int n = encode_channel_nl(p, remaining, chan[c],
+                                      frame_samples, wasted);
             if (n < 0) return -1;
             p += n; remaining -= n;
         }
-    } else {  /* AETHER_MODE_HQ */
-        const float *w = mdct_window();
-        for (int c = 0; c < enc->channels; c++) {
-            float buf[MDCT_SIZE];
-            /* previous hop, then this hop */
-            memcpy(buf, enc->hist[c], MDCT_HOP * sizeof(float));
-            for (int i = 0; i < MDCT_HOP; i++) {
-                float s = (float)pcm[i * enc->channels + c];
-                buf[MDCT_HOP + i] = s;
-                enc->hist[c][i]   = s;
-            }
-            for (int n = 0; n < MDCT_SIZE; n++) buf[n] *= w[n];
-
-            int n = encode_channel_hq(p, remaining, buf);
+    } else {  /* AETHER_MODE_HQ — one or more hops back to back */
+        int hops = frame_samples / MDCT_HOP;
+        for (int h = 0; h < hops; h++) {
+            int n = encode_hq_hop(enc, p, remaining,
+                                  pcm + (size_t)h * MDCT_HOP * enc->channels);
             if (n < 0) return -1;
             p += n; remaining -= n;
         }

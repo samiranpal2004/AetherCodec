@@ -3,7 +3,12 @@
    Listens on RFCOMM, feeds arriving packets through the jitter buffer, decodes
    them and plays the PCM out of the default output (the 3.5mm jack).
 
-     aether_receiver [--verbose] */
+   Every ~500 ms it also sends a CTRL_STATS_REPLY back up the same socket:
+   its measured sequence-gap loss, buffer depth and underrun count. The sender
+   feeds that into the ABR engine, which until this existed had to infer
+   everything from its own send queue.
+
+     aether_receiver [--l2cap] [--verbose] */
 #include "aether_decoder.h"
 #include "aether_packet.h"
 #include "transport_rfcomm.h"
@@ -52,10 +57,41 @@ static int ring_write_frames(AudioRing *r, const int32_t *pcm, uint32_t frames) 
     return 1;
 }
 
+/* Compose and send one CTRL_STATS_REPLY. Runs on the recv thread between
+   packets, so it shares the socket safely with the recv path (opposite
+   directions, separate transport buffers). */
+static void send_stats_reply(RFCOMMTransport *t, uint32_t *ctrl_seq,
+                             unsigned long got, unsigned long lost,
+                             unsigned long wgot, unsigned long wlost,
+                             int buffer_ms, unsigned long underruns) {
+    unsigned long dg = got - wgot, dl = lost - wlost;
+    float loss_pct = (dg + dl) ? 100.0f * (float)dl / (float)(dg + dl) : 0.0f;
+
+    AetherStatsReply sr = {
+        .type      = CTRL_STATS_REPLY,
+        .loss_x10  = (uint16_t)(loss_pct * 10.0f + 0.5f),
+        .buffer_ms = (uint16_t)(buffer_ms < 0 ? 0 : buffer_ms),
+        .underruns = (uint32_t)underruns,
+        .recv_total = (uint32_t)got,
+    };
+
+    AetherPacket pkt;
+    memset(&pkt, 0, sizeof(pkt.hdr));
+    pkt.hdr.magic        = AETHER_MAGIC;
+    pkt.hdr.sequence     = (*ctrl_seq)++;
+    pkt.hdr.timestamp_us = (uint32_t)aether_timestamp_us();
+    pkt.hdr.mode         = AETHER_MODE_CTRL;
+    pkt.hdr.payload_size = (uint16_t)sizeof(sr);
+    memcpy(pkt.payload, &sr, sizeof(sr));
+    rfcomm_send_packet(t, &pkt);   /* best-effort; a failure ends the stream anyway */
+}
+
 int main(int argc, char *argv[]) {
-    int verbose = 0;
-    for (int i = 1; i < argc; i++)
-        if (!strcmp(argv[i], "--verbose")) verbose = 1;
+    int verbose = 0, use_l2cap = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--verbose"))    verbose = 1;
+        else if (!strcmp(argv[i], "--l2cap")) use_l2cap = 1;
+    }
 
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
@@ -75,9 +111,11 @@ int main(int argc, char *argv[]) {
     JitterBuf     *jb  = jitter_buf_create(JITTER_MS, SAMPLE_RATE);
     if (!dec || !jb) { fprintf(stderr, "init failed\n"); return 1; }
 
-    printf("[receiver] Playback ready. Waiting for RFCOMM connection...\n");
-    RFCOMMTransport *t = rfcomm_listen(RFCOMM_CHANNEL);
-    if (!t) { fprintf(stderr, "[receiver] RFCOMM listen failed\n"); return 1; }
+    printf("[receiver] Playback ready. Waiting for %s connection...\n",
+           use_l2cap ? "L2CAP" : "RFCOMM");
+    RFCOMMTransport *t = use_l2cap ? l2cap_listen(AETHER_L2CAP_PSM)
+                                   : rfcomm_listen(RFCOMM_CHANNEL);
+    if (!t) { fprintf(stderr, "[receiver] listen failed\n"); return 1; }
 
     /* The playback stream is always 96 kHz; when ABR drops the stream to 48 kHz
        we interpolate back up so the OS-facing format never changes. */
@@ -102,11 +140,20 @@ int main(int argc, char *argv[]) {
     int32_t  tail[CHANNELS] = {0};   /* last emitted sample, for the fade-out */
     int      in_gap = 0;
 
+    /* Stats back-channel state: report every ~500 ms, loss measured over the
+       window since the previous report. */
+    uint32_t      ctrl_seq = 0;
+    uint64_t      last_stats_ms = aether_timestamp_us() / 1000ULL;
+    unsigned long wgot = 0, wlost = 0;
+
     while (running) {
         if (rfcomm_recv_packet(t, &pkt) < 0) {
             printf("[receiver] link closed\n");
             break;
         }
+        /* Control packets carry no audio and must never enter the jitter
+           buffer (their sequence numbering is independent of the stream's). */
+        if (pkt.hdr.mode == AETHER_MODE_CTRL) continue;
         got++;
         jitter_buf_insert(jb, &pkt);
 
@@ -173,6 +220,14 @@ int main(int argc, char *argv[]) {
 
             if (ring_write_frames(&play_ring, pcm, nf)) played++;
             else overflow++;
+        }
+
+        uint64_t now_ms = aether_timestamp_us() / 1000ULL;
+        if (now_ms - last_stats_ms >= 500) {
+            send_stats_reply(t, &ctrl_seq, got, lost, wgot, wlost,
+                             jitter_buf_level_ms(jb), pw_play_underruns(play));
+            wgot = got; wlost = lost;
+            last_stats_ms = now_ms;
         }
 
         if (verbose && (got % 100) == 0) {

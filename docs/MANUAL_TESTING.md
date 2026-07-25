@@ -85,6 +85,18 @@ design, so it reports SNR/bitrate instead (see §5).
 ./tools/rfcomm_bench client BB:BB:BB:BB:BB:BB
 ```
 
+Then repeat with `--l2cap` on **both** ends to bench the experimental L2CAP
+`SOCK_SEQPACKET` transport (no RFCOMM framing/credit flow control in the path):
+
+```bash
+# 🎧 B                                   # 🖥️ A
+./tools/rfcomm_bench server --l2cap      ./tools/rfcomm_bench client BB:BB:BB:BB:BB:BB --l2cap
+```
+
+If L2CAP measures meaningfully higher on your pair, run both daemons with
+`--l2cap` too (sender **and** receiver — the variants don't interoperate).
+The gain is hardware-dependent; RFCOMM stays the default.
+
 **Expect:** B prints a throughput line. **Record the number** — it sets the
 realistic bitrate ceiling for the codec.
 - `≥ 1000 kbps` → great, full 24/96 NL mode is feasible.
@@ -306,7 +318,10 @@ pw-play --target aether_codec_sink your_music.flac
 
 **Expect:** audio on B's headphones, and receiver stats showing
 `recv= played= lost= buffer=…ms underruns=`. Sustained playback should hold
-`lost=0` and `underruns` near 0 and flat.
+`lost=0` and `underruns` near 0 and flat. The sender's `[stats]` line also
+shows `rxloss=`/`rxbuf=` — the receiver's own loss measurement and buffer
+depth, reported back over the link every ~500 ms (`rxloss=` should agree with
+B's `lost=` rate; `rxbuf=-1ms` just means no report has arrived yet).
 
 > **Stutter?** The bitrate a mode needs may exceed what the link smoothly
 > carries. The sender decouples encode from send (a queue + send thread, bounded
@@ -458,10 +473,13 @@ evidence of a bad link.
 > why `auto` can sound clean where fixed NL-96k stutters. Covered by `test_abr`
 > (`congestion steps down despite strong RSSI`).
 >
-> **Not implemented:** on-air packet-loss feedback. `abr_classify` honours the
-> loss thresholds (and `test_abr` covers them), but the receiver's
-> `CTRL_STATS_REPLY` back-channel does not exist yet, so loss itself isn't
-> reported back — congestion is inferred from the send queue instead.
+> **Receiver loss feedback (`CTRL_STATS_REPLY`) is now implemented.** The
+> receiver reports its measured sequence-gap loss, buffer depth and underruns
+> back up the same socket every ~500 ms; the sender shows it as
+> `rxloss=`/`rxbuf=` in `[stats]` and feeds it to `abr_classify`'s 1/3/8%
+> loss thresholds. A report older than 2 s counts as "no data" (loss 0), so a
+> stalled reverse path can never wedge ABR. Congestion from the send queue
+> still applies on top.
 
 ---
 
@@ -594,7 +612,10 @@ Write down both addresses. Below, `BB:BB:BB:BB:BB:BB` is **B's** address.
 
 > Both laptops must run the **same build** — the wire format has no version
 > negotiation, so a stale binary on one side will mis-decode. Rebuild both from
-> the same commit if in doubt.
+> the same commit if in doubt. **The 2026-07-25 link-efficiency changes
+> (mid/side stereo, NL wasted bits, HQ 4-hop packet batching, stats
+> back-channel) changed the payload format** — a pre-change binary on either
+> side decodes garbage. Rebuild both.
 
 ### 9.1 Pair A and B (once)
 
@@ -726,9 +747,10 @@ audio never cuts out, only changes quality. If A prints `cannot read RSSI`, the
 `setcap` didn't take (or you rebuilt the binary — re-run it) and ABR holds its
 current state.
 
-> The live engine drives on **RSSI only** — packet-loss feedback
-> (`CTRL_STATS_REPLY`) isn't implemented yet, so a link that's strong but lossy
-> won't downgrade on its own. See §7.4.
+> The live engine drives on **RSSI + receiver-reported loss + send-queue
+> backpressure**: the receiver's `CTRL_STATS_REPLY` (watch `rxloss=` in the
+> sender's `[stats]`) now closes the loss loop, so a strong-but-lossy link
+> downgrades on its own. See §7.4.
 
 ### 9.5 Sustained run + record results
 
