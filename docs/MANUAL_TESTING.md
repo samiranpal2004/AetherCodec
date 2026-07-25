@@ -34,7 +34,7 @@ cd ~/aethercodec/build
 ctest --output-on-failure
 ```
 
-**Expect:** `100% tests passed, 0 tests failed out of 9`.
+**Expect:** `100% tests passed, 0 tests failed out of 10`.
 
 Run them individually to see the detail:
 
@@ -47,6 +47,7 @@ Run them individually to see the detail:
 ./tests/test_ring       # lock-free SPSC ring, incl. threaded producer/consumer
 ./tests/test_jitter     # jitter buffer: reorder, duplicate, loss detection
 ./tests/test_abr        # ABR ladder: classification + hysteresis timing
+./tests/test_abr_switch # mid-stream switches: sequence continuity + MDCT rate relatch
 ./tests/test_resample   # 2:1 decimate/interpolate for the 48 kHz states
 ```
 
@@ -278,13 +279,26 @@ pw-play --target aether_codec_sink your_music.flac
 `lost=0` and `underruns` near 0 and flat.
 
 > **Stutter?** The bitrate a mode needs may exceed what the link smoothly
-> carries — NL-96k (~1,400 kbps, often higher on dense music) is the hardest.
-> The sender decouples encode from send (a queue + send thread) and the receiver
+> carries. The sender decouples encode from send (a queue + send thread, bounded
+> at ~500 ms of *queued audio* so NL and HQ get the same slack) and the receiver
 > prebuffers ~250 ms, so a mode that *fits* plays cleanly. If a **fixed** mode
-> still stutters, the link can't carry it — use `--mode auto`, which now steps
-> down on **send-queue backpressure** (see §7), not just RSSI. Watch the
-> sender's `queue=`/`dropped=` fields: a queue that stays high or a rising
-> `dropped` count means that mode is over budget.
+> still stutters, the link can't carry it — use `--mode auto`, which steps down
+> on **send-queue backpressure** (see §7), not just RSSI. Watch the sender's
+> `queue=…ms` / `dropped=` fields: a queue that stays high or a rising `dropped`
+> count means that mode is over budget, and the sender says so once in plain
+> English.
+>
+> **NL-96k on a ~1 Mbps link will never be smooth.** Measured on real music it
+> needs **~3,100 kbps**, not the PRD's ~1,400: LPC gets about 1.5× on 24-bit
+> material, because the low bits of a 24-bit master are noise and Rice coding
+> cannot compress noise. Compare against your §9.2 `rfcomm_bench` number before
+> concluding anything is broken — if the ceiling is ~1,000 kbps, the modes that
+> actually fit are HQ-96k (~750 kbps) and HQ-48k (~500 kbps).
+>
+> Note also that the receiver's `lost=` counter is **not** on-air loss — RFCOMM
+> is a reliable stream. It counts gaps in the sequence, which in practice means
+> packets the *sender* dropped from its own send queue. Sender `dropped` and
+> receiver `lost` tracking each other is the signature.
 
 ### 6.4 Known environment limitation
 
@@ -528,7 +542,7 @@ On **each** laptop:
 
 ```bash
 # same checkout, clean build, all unit tests green
-cd ~/aethercodec/build && ctest        # expect 9/9
+cd ~/aethercodec/build && ctest        # expect 10/10
 
 # PipeWire session is up
 pgrep -a pipewire                      # must show a running server
@@ -712,13 +726,18 @@ into the comparison table in `docs/AetherCodec_IMPLEMENTATION.md` §6.4.
 | Two-machine `garbled after a while`, `underruns` climbing | link below the codec's bitrate | Check §9.2 throughput; use `--mode auto` or `hq` |
 | Stutter with **`lost=0` but huge `underruns`** (≫ playtime) | playback over-drained the ring (fixed) | Rebuild — playback now pins one quantum + prebuffers ~100 ms. `underruns` far exceeding total samples played meant the buffer was pulled several× realtime |
 | Rare click every few minutes, otherwise smooth | A/B sample-clock drift | Expected for now — no async resampler; the ~100 ms prebuffer re-primes on a full drain |
+| Receiver `played` frozen while `recv` climbs, `lost` flat | sender's packet sequence restarted (fixed) | Rebuild both sides. ABR switches used to recreate the encoder, resetting `sequence` to 0; the jitter buffer then discarded everything as "already played". It now re-anchors on a large discontinuity too |
+| `auto` sounds fine in NL but HQ is noise/dull after a switch | MDCT rate tables latched (fixed) | Rebuild both sides — `mdct_init()` now rebuilds the Bark/ATH tables when the rate changes. Mismatched tables between A and B decode as noise |
+| Receiver `lost` tracks the sender's `dropped` exactly | not on-air loss at all | RFCOMM is reliable; every "lost" packet was dropped from the sender's send queue. Read the *sender's* `dropped`, and treat it as "this mode is over the link's budget" |
+| `[stats]` shows an absurd kbps right after a mode switch (fixed) | bitrate mixed old bytes with new frame duration | Rebuild. The counter now resets per operating point and divides by wall-clock seconds |
+| Steady `overflow=` on the receiver | ring filling faster than playback drains | Sender clock running ahead, or the timebase is wrong. With current builds this should stay 0 |
 
 ---
 
 ## 11. Quick checklist
 
 - [ ] `make` — clean build, no warnings
-- [ ] `ctest` — 9/9 pass
+- [ ] `ctest` — 10/10 pass
 - [ ] `rfcomm_ping` — 10 pings received on B
 - [ ] `rfcomm_bench` — throughput recorded: ______ kbps
 - [ ] `raw_stream` — audible on B
@@ -730,6 +749,7 @@ into the comparison table in `docs/AetherCodec_IMPLEMENTATION.md` §6.4.
 - [ ] `--loopback` — `frames` counter advances while playing audio in
 - [ ] Two-machine: audio on B's headphones, `lost=0 underruns=0`
 - [ ] `test_abr` — downgrade ≤ 1 s, upgrade held 3 s, no oscillation
+- [ ] `test_abr_switch` — sequence continuous across the ladder; HQ SNR > 15 dB after a 96k→48k switch
 - [ ] `test_resample` — 1 kHz ratio ≈ 1.00, 35 kHz rejected < −40 dB
 - [ ] `--abr-demo` — transitions logged and `mode=`/`rate=` follow, no errors
 - [ ] Real range test: NL-96k held at 0–1 m, degrades gracefully at 5 m+

@@ -28,6 +28,13 @@ int aether_encoder_encode(AetherEncoder *enc, const int32_t *pcm_in,
 /* Switch mode mid-stream (ABR callback). Takes effect from next frame. */
 void aether_encoder_set_mode(AetherEncoder *enc, int new_mode);
 
+/* Switch mode AND sample rate mid-stream, preserving the packet sequence
+   counter. Use this for every ABR transition instead of destroy + create:
+   `sequence` belongs to the stream, not to the codec instance, and restarting
+   it at 0 makes the receiver's jitter buffer discard every subsequent packet
+   as "already played" until the counter climbs back past where it was. */
+void aether_encoder_reconfigure(AetherEncoder *enc, int mode, int sample_rate);
+
 void aether_encoder_destroy(AetherEncoder *enc);
 
 #endif /* AETHER_ENCODER_H */

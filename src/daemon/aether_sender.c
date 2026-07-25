@@ -44,9 +44,17 @@
 #define RING_FRAMES 64
 #define ABR_POLL_MS 500
 
-/* Send queue: bounded FIFO of whole packets between encode and send threads. */
-#define SENDQ_CAP   24
-#define SENDQ_HIGH  8     /* depth above which the link is treated as congested */
+/* Send queue: bounded FIFO of packets between the encode and send threads.
+   Bounded by QUEUED AUDIO TIME, not by slot count. Sizing it in packets was a
+   bug in disguise: an NL frame is 2048 samples (21 ms) but an HQ frame is only
+   512 (5.3 ms), so 24 slots meant 512 ms of slack in NL and just 128 ms in HQ.
+   Any Bluetooth hiccup longer than that — retransmits, WiFi coexistence, a page
+   scan — overflowed the queue and dropped frames even though HQ's *average*
+   rate fits the link comfortably. That is exactly the observed pattern: bursts
+   of drops separated by long clean stretches. */
+#define SENDQ_CAP       160   /* slot ceiling; the real bound is SENDQ_MAX_MS  */
+#define SENDQ_MAX_MS    500   /* drop the oldest beyond this much queued audio */
+#define SENDQ_HIGH_MS   200   /* above this the link is treated as congested   */
 
 static volatile sig_atomic_t running = 1;
 static void on_sigint(int sig) { (void)sig; running = 0; }
@@ -58,7 +66,9 @@ static _Atomic int pending_state = -1;
 
 typedef struct {
     AetherPacket   *slots;
+    float          *slot_ms;      /* audio duration carried by each slot */
     int             head, tail, count;
+    float           queued_ms;
     int             closed;
     unsigned long   dropped;
     pthread_mutex_t mtx;
@@ -67,28 +77,47 @@ typedef struct {
 
 static SendQueue g_sendq;
 
+/* An AetherPacket is ~64 KB of which only payload_size bytes are live. At
+   187 packets/s in HQ a full-struct memcpy on both push and pop burns ~24 MB/s
+   for nothing. */
+static void packet_copy(AetherPacket *dst, const AetherPacket *src) {
+    dst->hdr = src->hdr;
+    memcpy(dst->payload, src->payload, src->hdr.payload_size);
+    dst->payload_crc32 = src->payload_crc32;
+}
+
 static int sendq_init(SendQueue *q) {
-    q->slots = calloc(SENDQ_CAP, sizeof(AetherPacket));
-    if (!q->slots) return -1;
+    q->slots   = calloc(SENDQ_CAP, sizeof(AetherPacket));
+    q->slot_ms = calloc(SENDQ_CAP, sizeof(float));
+    if (!q->slots || !q->slot_ms) return -1;
     q->head = q->tail = q->count = 0;
+    q->queued_ms = 0.0f;
     q->closed = 0; q->dropped = 0;
     pthread_mutex_init(&q->mtx, NULL);
     pthread_cond_init(&q->cv, NULL);
     return 0;
 }
 
-static void sendq_push(SendQueue *q, const AetherPacket *pkt) {
+static void sendq_drop_oldest(SendQueue *q) {
+    q->queued_ms -= q->slot_ms[q->tail];
+    if (q->queued_ms < 0.0f) q->queued_ms = 0.0f;
+    q->tail = (q->tail + 1) % SENDQ_CAP;
+    q->count--;
+    q->dropped++;
+}
+
+static void sendq_push(SendQueue *q, const AetherPacket *pkt, float dur_ms) {
     pthread_mutex_lock(&q->mtx);
-    if (q->count == SENDQ_CAP) {
-        /* Drop the oldest to bound latency; the receiver conceals the gap.
-           Dropping is itself the congestion signal (see sendq_dropped). */
-        q->tail = (q->tail + 1) % SENDQ_CAP;
-        q->count--;
-        q->dropped++;
-    }
-    memcpy(&q->slots[q->head], pkt, sizeof(AetherPacket));
+    /* Drop the oldest to bound latency; the receiver conceals the gap.
+       Dropping is itself the congestion signal (see sendq_dropped). */
+    while (q->count == SENDQ_CAP ||
+           (q->count > 0 && q->queued_ms + dur_ms > (float)SENDQ_MAX_MS))
+        sendq_drop_oldest(q);
+    packet_copy(&q->slots[q->head], pkt);
+    q->slot_ms[q->head] = dur_ms;
     q->head = (q->head + 1) % SENDQ_CAP;
     q->count++;
+    q->queued_ms += dur_ms;
     pthread_cond_signal(&q->cv);
     pthread_mutex_unlock(&q->mtx);
 }
@@ -98,7 +127,9 @@ static int sendq_pop(SendQueue *q, AetherPacket *out) {
     while (q->count == 0 && !q->closed)
         pthread_cond_wait(&q->cv, &q->mtx);
     if (q->count == 0) { pthread_mutex_unlock(&q->mtx); return -1; }
-    memcpy(out, &q->slots[q->tail], sizeof(AetherPacket));
+    packet_copy(out, &q->slots[q->tail]);
+    q->queued_ms -= q->slot_ms[q->tail];
+    if (q->queued_ms < 0.0f) q->queued_ms = 0.0f;
     q->tail = (q->tail + 1) % SENDQ_CAP;
     q->count--;
     pthread_mutex_unlock(&q->mtx);
@@ -112,11 +143,11 @@ static void sendq_close(SendQueue *q) {
     pthread_mutex_unlock(&q->mtx);
 }
 
-static int sendq_depth(SendQueue *q) {
+static int sendq_depth_ms(SendQueue *q) {
     pthread_mutex_lock(&q->mtx);
-    int c = q->count;
+    int ms = (int)q->queued_ms;
     pthread_mutex_unlock(&q->mtx);
-    return c;
+    return ms;
 }
 
 static unsigned long sendq_dropped(SendQueue *q) {
@@ -127,7 +158,8 @@ static unsigned long sendq_dropped(SendQueue *q) {
 }
 
 static void sendq_free(SendQueue *q) {
-    free(q->slots); q->slots = NULL;
+    free(q->slots);   q->slots   = NULL;
+    free(q->slot_ms); q->slot_ms = NULL;
     pthread_mutex_destroy(&q->mtx);
     pthread_cond_destroy(&q->cv);
 }
@@ -195,9 +227,9 @@ static void *abr_thread(void *arg) {
            cannot carry the current mode, regardless of how strong RSSI is. */
         int congested = 0;
         if (!a->loopback) {
-            int depth = sendq_depth(&g_sendq);
+            int depth_ms = sendq_depth_ms(&g_sendq);
             unsigned long d = sendq_dropped(&g_sendq);
-            congested = (depth > SENDQ_HIGH) || (d > last_dropped);
+            congested = (depth_ms > SENDQ_HIGH_MS) || (d > last_dropped);
             last_dropped = d;
         }
 
@@ -331,7 +363,15 @@ int main(int argc, char *argv[]) {
     static int32_t dec_out[LPC_FRAME_SIZE * CHANNELS];
     static int32_t up_out[LPC_FRAME_SIZE * 2 * CHANNELS];
     AetherPacket pkt;
-    unsigned long frames = 0, bytes = 0;
+    unsigned long frames = 0;
+    /* Bitrate accounting is per operating point and measured against the WALL
+       clock. Previously it divided cumulative bytes by cumulative *audio* time
+       and never reset on a mode switch, so the first line after each switch
+       mixed the old mode's bytes with the new mode's frame duration — that is
+       where readings like "3653 kbps" came from. */
+    unsigned long seg_frames = 0, seg_bytes = 0;
+    uint64_t      seg_start_us = aether_timestamp_us();
+    int           over_budget_warned = 0;
 
     while (running) {
         int ps = atomic_exchange(&pending_state, -1);
@@ -340,12 +380,15 @@ int main(int argc, char *argv[]) {
             int new_rate = abr_state_rate((ABRState)ps);
             if (new_mode != mode || new_rate != rate) {
                 mode = new_mode; rate = new_rate;
-                aether_encoder_destroy(enc);
-                enc = aether_encoder_create(mode, rate, BIT_DEPTH, CHANNELS);
-                if (!enc) { fprintf(stderr, "[sender] re-init failed\n"); break; }
+                /* Reconfigure in place: destroying the encoder would restart the
+                   packet sequence at 0, which wedges the receiver's jitter
+                   buffer for as many frames as had already been sent. */
+                aether_encoder_reconfigure(enc, mode, rate);
                 resample_reset(&down);
                 resample_reset(&up);
                 if (dec) aether_decoder_flush(dec);
+                seg_frames = 0; seg_bytes = 0;
+                seg_start_us = aether_timestamp_us();
             }
         }
 
@@ -370,7 +413,8 @@ int main(int argc, char *argv[]) {
             continue;
         }
         frames++;
-        bytes += pkt.hdr.payload_size;
+        seg_frames++;
+        seg_bytes += AETHER_HEADER_SIZE + pkt.hdr.payload_size + 4;
 
         if (loopback) {
             int n = aether_decoder_decode(dec, &pkt, dec_out,
@@ -385,22 +429,44 @@ int main(int argc, char *argv[]) {
                 }
             }
         } else {
-            sendq_push(&g_sendq, &pkt);   /* never blocks the encode loop */
+            /* never blocks the encode loop */
+            sendq_push(&g_sendq, &pkt, 1000.0f * coded_frame / rate);
         }
 
         if (verbose && (frames % 100) == 0) {
-            double secs = (double)frames * coded_frame / rate;
+            double audio_s = (double)seg_frames * coded_frame / rate;
+            double wall_s  = (aether_timestamp_us() - seg_start_us) / 1e6;
+            if (wall_s < 1e-6) wall_s = 1e-6;
+            double kbps = seg_bytes * 8.0 / 1000.0 / audio_s;
             if (loopback)
                 printf("[stats] frames=%lu  %.1fs  %.0f kbps  mode=%s rate=%d\n",
-                       frames, secs, bytes * 8.0 / 1000.0 / secs,
+                       frames, wall_s, kbps,
                        mode == AETHER_MODE_NL ? "NL" : "HQ", rate);
             else
                 printf("[stats] frames=%lu  %.1fs  %.0f kbps  mode=%s rate=%d  "
-                       "queue=%d dropped=%lu\n",
-                       frames, secs, bytes * 8.0 / 1000.0 / secs,
+                       "queue=%dms dropped=%lu\n",
+                       frames, wall_s, kbps,
                        mode == AETHER_MODE_NL ? "NL" : "HQ", rate,
-                       sendq_depth(&g_sendq), sendq_dropped(&g_sendq));
+                       sendq_depth_ms(&g_sendq), sendq_dropped(&g_sendq));
             fflush(stdout);
+
+            /* A fixed mode that keeps dropping is simply over the link's
+               budget. No amount of queueing fixes that — say so once instead of
+               letting the user chase a phantom bug. NL-96k on real 24-bit music
+               compresses to ~2.5-3 Mbps (LPC gets ~1.5x, not the PRD's assumed
+               3.3x), which is well past what RFCOMM/EDR carries. */
+            if (!loopback && !auto_mode && !over_budget_warned &&
+                sendq_dropped(&g_sendq) > 100) {
+                over_budget_warned = 1;
+                fprintf(stderr,
+                    "[sender] WARNING: %s-%dk needs ~%.0f kbps but the link "
+                    "cannot carry it — frames are being dropped and playback "
+                    "will glitch.\n"
+                    "         Use --mode auto (picks the best mode the link "
+                    "sustains) or --mode hq.\n"
+                    "         Compare with ./tools/rfcomm_bench.\n",
+                    mode == AETHER_MODE_NL ? "NL" : "HQ", rate / 1000, kbps);
+            }
         }
     }
 

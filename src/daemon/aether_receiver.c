@@ -16,14 +16,40 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <math.h>
 
 #define SAMPLE_RATE 96000
 #define CHANNELS    2
 #define JITTER_MS   40
-#define RING_FRAMES 64
+
+/* Playback ring, in output frames at SAMPLE_RATE. Must comfortably exceed the
+   playback prebuffer (250 ms) plus the largest burst the sender's send queue
+   can deliver at once, or bursts get truncated on write — which is a click. */
+#define RING_MS     2000
+#define RING_VALS   (SAMPLE_RATE / 1000 * RING_MS * CHANNELS)
+
+/* Crossfade applied at the edges of a concealed gap. Writing a hard zero after
+   a non-zero sample (and a non-zero sample after the zeros) is a step
+   discontinuity — i.e. an audible click on every single lost packet. HLD 12.1's
+   "insert silence" is kept as the strategy; this just ramps into and out of it. */
+#define FADE_MS     5
+#define FADE_FRAMES (SAMPLE_RATE / 1000 * FADE_MS)
+
+/* Largest concealment we ever emit: one NL frame at 48 kHz, interpolated to 96. */
+#define MAX_OUT_FRAMES (LPC_FRAME_SIZE * 2)
 
 static volatile sig_atomic_t running = 1;
 static void on_sigint(int sig) { (void)sig; running = 0; }
+
+/* Whole-frame-or-nothing write. audio_ring_write() truncates on overflow, and a
+   truncated frame tears the stream mid-sample; dropping the frame outright is
+   both cleaner and countable. */
+static int ring_write_frames(AudioRing *r, const int32_t *pcm, uint32_t frames) {
+    uint32_t vals = frames * CHANNELS;
+    if (audio_ring_space(r) < vals) return 0;
+    audio_ring_write(r, pcm, vals);
+    return 1;
+}
 
 int main(int argc, char *argv[]) {
     int verbose = 0;
@@ -34,7 +60,7 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, on_sigint);
 
     AudioRing play_ring;
-    if (audio_ring_init(&play_ring, LPC_FRAME_SIZE * CHANNELS * RING_FRAMES)) {
+    if (audio_ring_init(&play_ring, RING_VALS)) {
         fprintf(stderr, "ring alloc failed\n"); return 1;
     }
 
@@ -60,8 +86,20 @@ int main(int argc, char *argv[]) {
 
     AetherPacket pkt;
     int32_t out[LPC_FRAME_SIZE * CHANNELS];
-    int32_t up_out[LPC_FRAME_SIZE * 2 * CHANNELS];
-    unsigned long got = 0, played = 0, lost = 0;
+    int32_t up_out[MAX_OUT_FRAMES * CHANNELS];
+    int32_t gap[MAX_OUT_FRAMES * CHANNELS];
+    unsigned long got = 0, played = 0, lost = 0, overflow = 0;
+
+    /* How many output frames (at SAMPLE_RATE) one packet is worth. Concealment
+       must emit exactly this much or the stream's timebase drifts: an NL frame
+       is 2048 samples but an HQ frame is only 512, and a 48 kHz frame doubles
+       on the way out. The old code always wrote 2048 frames of silence, so in
+       HQ-96k every lost packet injected 4x too much silence — with ~25% loss
+       that is tens of seconds of bogus silence stretched through the stream,
+       which also kept the ring pinned full so real audio got truncated. */
+    uint32_t out_frames = LPC_FRAME_SIZE;
+    int32_t  tail[CHANNELS] = {0};   /* last emitted sample, for the fade-out */
+    int      in_gap = 0;
 
     while (running) {
         if (rfcomm_recv_packet(t, &pkt) < 0) {
@@ -77,42 +115,78 @@ int main(int argc, char *argv[]) {
             const AetherPacket *p = jitter_buf_pop_ex(jb, &was_lost);
             if (!p) {
                 if (was_lost) {
-                    /* Concealment strategy 1 (HLD 12.1): insert silence. */
+                    /* Concealment strategy 1 (HLD 12.1): insert silence — but
+                       ramped down from the last real sample so the gap does not
+                       start with a step discontinuity. */
                     lost++;
-                    memset(out, 0, sizeof(int32_t) * LPC_FRAME_SIZE * CHANNELS);
-                    audio_ring_write(&play_ring, out, LPC_FRAME_SIZE * CHANNELS);
+                    uint32_t nf = out_frames;
+                    uint32_t fade = nf < FADE_FRAMES ? nf : FADE_FRAMES;
+                    for (uint32_t i = 0; i < nf; i++) {
+                        float g = 0.0f;
+                        if (!in_gap && i < fade)
+                            g = 0.5f * (1.0f + cosf((float)M_PI * i / fade));
+                        for (int c = 0; c < CHANNELS; c++)
+                            gap[i * CHANNELS + c] = (int32_t)(tail[c] * g);
+                    }
+                    if (!ring_write_frames(&play_ring, gap, nf)) overflow++;
+                    in_gap = 1;
                     continue;
                 }
                 break;
             }
             int n = aether_decoder_decode(dec, p, out, LPC_FRAME_SIZE * CHANNELS);
-            if (n > 0) {
-                int rate = (p->hdr.sample_rate == AETHER_RATE_48000) ? 48000
-                                                                     : SAMPLE_RATE;
-                if (rate != last_rate) {
-                    printf("[receiver] stream rate -> %d Hz, mode=%s\n", rate,
-                           p->hdr.mode == AETHER_MODE_NL ? "NL" : "HQ");
-                    resample_reset(&up);
-                    last_rate = rate;
-                }
-                if (rate != SAMPLE_RATE) {
-                    int m = resample_up2(&up, out, n / CHANNELS, up_out);
-                    audio_ring_write(&play_ring, up_out, (uint32_t)m * CHANNELS);
-                } else {
-                    audio_ring_write(&play_ring, out, (uint32_t)n);
-                }
-                played++;
+            if (n <= 0) continue;
+
+            int rate = (p->hdr.sample_rate == AETHER_RATE_48000) ? 48000
+                                                                 : SAMPLE_RATE;
+            if (rate != last_rate) {
+                printf("[receiver] stream rate -> %d Hz, mode=%s\n", rate,
+                       p->hdr.mode == AETHER_MODE_NL ? "NL" : "HQ");
+                resample_reset(&up);
+                last_rate = rate;
             }
+
+            int32_t *pcm;
+            uint32_t nf;
+            if (rate != SAMPLE_RATE) {
+                nf  = (uint32_t)resample_up2(&up, out, n / CHANNELS, up_out);
+                pcm = up_out;
+            } else {
+                nf  = (uint32_t)(n / CHANNELS);
+                pcm = out;
+            }
+            out_frames = nf;
+
+            /* Ramp back in after a concealed gap, for the same reason. */
+            if (in_gap) {
+                uint32_t fade = nf < FADE_FRAMES ? nf : FADE_FRAMES;
+                for (uint32_t i = 0; i < fade; i++) {
+                    float g = 0.5f * (1.0f - cosf((float)M_PI * i / fade));
+                    for (int c = 0; c < CHANNELS; c++)
+                        pcm[i * CHANNELS + c] = (int32_t)(pcm[i * CHANNELS + c] * g);
+                }
+                in_gap = 0;
+            }
+            for (int c = 0; c < CHANNELS; c++)
+                tail[c] = pcm[(nf - 1) * CHANNELS + c];
+
+            if (ring_write_frames(&play_ring, pcm, nf)) played++;
+            else overflow++;
         }
 
-        if (verbose && (got % 100) == 0)
-            printf("[stats] recv=%lu played=%lu lost=%lu buffer=%dms underruns=%lu\n",
-                   got, played, lost, jitter_buf_level_ms(jb),
-                   pw_play_underruns(play));
+        if (verbose && (got % 100) == 0) {
+            printf("[stats] recv=%lu played=%lu lost=%lu overflow=%lu "
+                   "buffer=%dms underruns=%lu resync=%lu\n",
+                   got, played, lost, overflow, jitter_buf_level_ms(jb),
+                   pw_play_underruns(play), jitter_buf_resyncs(jb));
+            fflush(stdout);
+        }
     }
 
-    printf("[receiver] recv=%lu played=%lu lost=%lu underruns=%lu\n",
-           got, played, lost, pw_play_underruns(play));
+    printf("[receiver] recv=%lu played=%lu lost=%lu overflow=%lu underruns=%lu "
+           "resync=%lu\n",
+           got, played, lost, overflow, pw_play_underruns(play),
+           jitter_buf_resyncs(jb));
 
     rfcomm_server_close(t);
     jitter_buf_destroy(jb);

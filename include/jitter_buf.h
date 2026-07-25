@@ -25,6 +25,10 @@ const AetherPacket* jitter_buf_pop_ex(JitterBuf *jb, int *lost);
 /* Get current buffer level in ms (for stats reporting) */
 int jitter_buf_level_ms(const JitterBuf *jb);
 
+/* How many times the buffer had to re-anchor on a sequence discontinuity too
+   large to be reordering or loss (sender restart, or a very long outage). */
+unsigned long jitter_buf_resyncs(const JitterBuf *jb);
+
 void jitter_buf_destroy(JitterBuf *jb);
 
 #endif /* JITTER_BUF_H */

@@ -2101,6 +2101,70 @@ static void *abr_thread(void *arg) {
 >   ladder can be exercised on a single machine (Step 5.3 otherwise needs two
 >   laptops and physical distance).
 
+#### Bugs found by the first real two-laptop run (2026-07-25)
+
+The first A→B run of all three modes produced continuous crackling in *every*
+mode. Five distinct defects; all are fixed, and the first four are the kind that
+only appear once real packets cross a real link.
+
+1. **The packet sequence restarted at 0 on every ABR switch.**
+   `aether_encoder_create()` sets `sequence = 0`, and the sender destroyed and
+   recreated the encoder on each transition. The receiver's jitter buffer then
+   saw every packet as older than `next_seq` and discarded the lot — playout
+   froze for exactly as many frames as had already been sent (visible in the
+   capture as `played` stuck at 2054 while `recv` climbed from 2200 to 4250,
+   recovering the instant the counter caught up). Fixed with
+   `aether_encoder_reconfigure()`, which changes mode/rate in place and keeps
+   the sequence; `jitter_buf` additionally re-anchors on any discontinuity
+   larger than `JB_RESYNC_GAP` so a sender restart can no longer wedge a live
+   receiver. Covered by `test_abr_switch` and two new `test_jitter` cases.
+
+2. **`mdct_init()` latched the sample rate of its first call.** The early
+   `if (mdct_ready) return;` meant the Bark map and ATH table were never rebuilt
+   for a new rate. Encoder-side that low-passes every 48 kHz HQ state at
+   ~8.8 kHz instead of ~17.6 kHz; worse, the *decoder* calls `mdct_init()` from
+   the first HQ packet it sees, so a receiver that joined during an NL-96k
+   stretch and first saw HQ-48k built a different `band_start[]` than the
+   sender — dequantisation then applies the wrong step to the wrong bins, which
+   is noise, not an artifact. The window and FFTW plan stay one-shot (they are
+   rate-independent); the two rate-dependent tables now rebuild on change.
+   `test_abr_switch` asserts >15 dB SNR across a 96k→48k switch (measures
+   26.8 dB; the latched build fails at the assert).
+
+3. **Concealment always emitted 2048 frames of silence, whatever the frame
+   was.** An NL frame is 2048 samples but an HQ frame is 512, and a 48 kHz frame
+   doubles on interpolation. So a lost HQ-96k packet injected 4× too much
+   silence, HQ-48k 2× too much, NL-48k half as much as needed. At the ~25% loss
+   the run was seeing, that is roughly 35 s of bogus silence stretched through a
+   53 s stream — the timebase is destroyed and the ring stays pinned full, so
+   real audio gets truncated on write too. The receiver now tracks the actual
+   output length of the last decoded packet and conceals exactly that much.
+
+4. **The send queue was bounded in packets, not in time.** `SENDQ_CAP 24` is
+   512 ms of slack in NL (21 ms frames) but only 128 ms in HQ (5.3 ms frames),
+   so any Bluetooth hiccup longer than that overflowed and dropped frames even
+   though HQ's *average* rate fits the link — exactly the observed pattern of
+   drop bursts separated by long clean stretches. The queue is now bounded by
+   queued audio duration (`SENDQ_MAX_MS 500`, congestion at `SENDQ_HIGH_MS 200`),
+   so both modes get the same real buffering and ABR's backpressure signal means
+   the same thing in both.
+
+5. **Two smaller ones.** Gaps were written as a hard zero — a step discontinuity,
+   i.e. a click on every lost packet — so concealment now ramps in and out over
+   5 ms. And playback took *partial* reads from the ring, re-priming only on a
+   completely empty ring; that leaves the ring hovering near empty and feeds the
+   DAC half-filled buffers (continuous crackle instead of one clean gap). It is
+   now all-or-nothing per quantum.
+
+> **NL-96k does not fit a ~1 Mbps RFCOMM link, and no buffering changes that.**
+> The run measured **~3,100 kbps** for NL-96k on real music against a
+> `rfcomm_bench` ceiling of **1,003 kbps**. The PRD's ~1,400 kbps assumes LPC
+> gets ~3.3× on 24-bit material; it gets ~1.5×, because the low bits of a 24-bit
+> master are essentially noise and Rice coding cannot compress noise. This is
+> data, not a defect — `--mode auto` correctly steps away from NL-96k, and the
+> sender now prints a one-time warning naming the measured rate when a *fixed*
+> mode keeps dropping, instead of leaving the user to infer it from the counters.
+
 ---
 
 ## Phase 6 — End-to-End Demo & Measurement
