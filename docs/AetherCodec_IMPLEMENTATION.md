@@ -2480,14 +2480,18 @@ Same per-frame decision for HQ, but applied to MDCT *coefficients*
 equivalent, and doing it after the MDCT keeps the decoder's overlap-add history
 in L/R space, letting the decision flip freely between frames.
 
-### 7.4 HQ frame batching (4 hops per packet)
+### 7.4 HQ frame batching (⚠️ REVERTED — see Phase 9)
 
 One hop per packet meant 187 packets/s at 96 kHz — ~36 kbps of header+CRC,
-15%+ of a weak link. The daemons now send `AETHER_HQ_HOPS_PER_PKT = 4` MDCT
+15%+ of a weak link. The daemons briefly sent `AETHER_HQ_HOPS_PER_PKT = 4` MDCT
 hops per packet (2048 samples, same duration as an NL frame). Measured
 (`test_codec_hq`): 598 → 569 kbps at *identical* SNR. The encoder accepts any
 multiple of `MDCT_HOP` up to `LPC_FRAME_SIZE`; the payload's leading
 `frame_samples` is the total, so the jitter buffer's level maths stay right.
+
+**This was reverted to 1 in Phase 9** — it caused audible HQ/auto stutter over
+Bluetooth. The wire format still supports batching and `test_codec_hq` still
+covers it; only the daemons' choice changed.
 
 ### 7.5 L2CAP SOCK_SEQPACKET transport (experimental, `--l2cap`)
 
@@ -2593,6 +2597,76 @@ still steps it down if that assumption ever breaks.
   retransmits add latency exactly when the network is worst. TCP is the right
   first move because it reuses the framing loop verbatim.
 - **Discovery.** No mDNS / Wi-Fi Direct; the receiver's IP is typed by hand.
+
+---
+
+## Phase 9 — HQ/auto stutter fix (2026-07-26)
+
+> **Report:** "previously perfect, now clear jitter in HQ and auto" over
+> **Bluetooth RFCOMM**, symptom = gaps/dropouts. NL unaffected. Two defects
+> introduced in Phase 7 were responsible; both only bite on a link constrained
+> enough to drop or stall packets, which is why single-machine tests and the
+> TCP path never showed them.
+
+### 9.1 What was ruled out first
+
+Worth recording, because the obvious suspects were wrong:
+
+| Hypothesis | Measurement | Verdict |
+|---|---|---|
+| HQ mid/side decision flipping frame to frame | 6 flips per 400 hops (2.8/s); SNR on flip hops **27.6 dB** vs 27.3 dB stable | not the cause |
+| Mid/side crushing the side channel (stereo flutter) | L−R SNR **24.8 dB** vs 27.3 dB overall — 2.5 dB gap | not the cause |
+| Encode CPU burst from batching / high SMR | **1.7%** of realtime at SMR 54 (0.36 ms per 21.3 ms packet) | not the cause |
+
+### 9.2 Root cause 1 — packet batching quadrupled the concealment gap
+
+`AETHER_HQ_HOPS_PER_PKT` **4 → 1**.
+
+A packet is the unit of loss *and* of concealment: when the send queue sheds
+one — exactly what a saturated Bluetooth link forces — the receiver fills that
+packet's whole duration with silence. At 4 hops every drop became a **21.3 ms
+hole instead of 5.3 ms**, four times the audible gap, in exchange for a 14%
+bitrate saving that does not prevent the drop. Dropped packets are what
+listeners hear; header bytes are not.
+
+This explains the symptom pattern exactly: NL's frame has always been 2048
+samples, so NL was untouched, and `auto` degraded only because its lower rungs
+are HQ.
+
+Verified end to end: sender now reports **`queue=5ms`** (was `21ms`) at
+~187 packets/s, `dropped=0 lost=0 underruns=0`.
+
+### 9.3 Root cause 2 — the stats reply blocked the audio thread
+
+`rfcomm_try_send_packet()` (new, `MSG_DONTWAIT`) now carries
+`CTRL_STATS_REPLY`; the report is skipped rather than queued if the socket is
+full.
+
+The receiver builds that report every 500 ms **on the thread that drains audio
+into the playback ring**, and it used the blocking `rfcomm_send_packet`. On
+Bluetooth the reverse direction competes for airtime with the forward stream,
+so it congests precisely when the stream is already struggling — the send
+parks, packet intake stalls, the sender's socket backs up, its queue sheds
+frames, and the listener hears a gap. A stats report causing the very loss it
+exists to report.
+
+Dropping a report is free: the sender treats anything older than 2 s as "no
+data" and drives ABR from send-queue backpressure instead.
+
+### ✅ Phase 9 Checkpoint
+
+- [x] `ctest` 10/10, clean build — batched format still covered by
+      `test_codec_hq`, so wire-format support is unchanged and re-raising the
+      constant stays a one-line change
+- [x] HQ end-to-end: `queue=5ms` (was 21 ms), `dropped=0 lost=0 underruns=0
+      overflow=0` over 60 s
+- [ ] Two-laptop Bluetooth re-test of `--mode hq` and `--mode auto` — needs
+      second laptop
+
+> **Standing caveat.** These fixes remove the *added* stutter, but the SMR
+> controller still drives HQ to ~**882 kbps** at its 54 dB ceiling, which no
+> measured RFCOMM link here carries. Bluetooth remains the wrong transport for
+> this codec; `--tcp` (Phase 8) is what actually delivers NL/HQ cleanly.
 
 ---
 

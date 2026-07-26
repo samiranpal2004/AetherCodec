@@ -47,6 +47,21 @@ int tcp_parse_target(const char *target, char *host_out, size_t host_size,
 int  rfcomm_send_packet(RFCOMMTransport *t, const AetherPacket *pkt);
 int  rfcomm_recv_packet(RFCOMMTransport *t, AetherPacket *pkt_out);
 
+/* Non-blocking send: transmits only if the socket can take the whole packet
+   right now, otherwise gives up and reports it. Returns 0 sent, 1 skipped
+   (would have blocked), -1 on a real error.
+
+   This exists for the receiver's CTRL_STATS_REPLY. That report is produced on
+   the same thread that drains audio, so a blocking send there stalls packet
+   intake whenever the reverse direction is congested — and on Bluetooth the
+   reverse direction shares airtime with the audio stream, so it congests
+   exactly when the stream is already struggling. The stall then backs up the
+   sender's socket, its send queue sheds frames, and the listener hears a gap:
+   a stats report causing the very loss it is meant to report. Skipping a
+   report is free by comparison (the sender treats anything older than 2 s as
+   "no data" and falls back to queue backpressure). */
+int  rfcomm_try_send_packet(RFCOMMTransport *t, const AetherPacket *pkt);
+
 /* Get raw socket fd (for select/poll) */
 int  rfcomm_get_fd(const RFCOMMTransport *t);
 

@@ -62,9 +62,12 @@ sources get added to the matching `src/CMakeLists.txt` target as each phase land
 then per coded channel `[order:u8][rice_k:u8][wasted:u8][coeffs:order·i32][warmup:order·i32][rice_len:u16][rice_bytes]`
 — `wasted` = shared low zero bits shifted out pre-LPC, restored post-synthesis.
 
-**HQ payload format**: `[frame_samples:u16]` (total; 1–4 hops, multiple of
-`MDCT_HOP` — daemons batch `AETHER_HQ_HOPS_PER_PKT=4` to amortise the 24-byte
-header) then per hop `[flags:u8]` (bit0 = mid/side, applied to MDCT
+**HQ payload format**: `[frame_samples:u16]` (total; any multiple of `MDCT_HOP`
+up to `LPC_FRAME_SIZE` — but daemons send `AETHER_HQ_HOPS_PER_PKT=1`; batching
+to 4 amortised the 24-byte header yet **quadrupled every concealment gap**
+(21.3 ms vs 5.3 ms per dropped packet) and was the cause of the HQ/auto
+stutter, so don't raise it for a lossy link) then per hop `[flags:u8]`
+(bit0 = mid/side, applied to MDCT
 *coefficients* so the decoder's OLA history stays in L/R space) then per coded
 channel `[band_mask:u64][sf_rice_k:u8][sf_len:u16][sf_bytes][cf_rice_k:u8][cf_len:u16][cf_bytes]`
 — scalefactors and coefficients cover only the bands set in the mask.
