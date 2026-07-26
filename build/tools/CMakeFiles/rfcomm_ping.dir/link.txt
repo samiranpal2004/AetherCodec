@@ -1,1 +1,0 @@
-/usr/bin/cc  -Wall -Wextra -O2 -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/rfcomm_ping.dir/link.d CMakeFiles/rfcomm_ping.dir/rfcomm_ping.c.o -o rfcomm_ping  ../src/libaether_transport.a -lbluetooth

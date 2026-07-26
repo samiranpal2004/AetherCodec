@@ -1,1 +1,0 @@
-/usr/bin/cc  -Wall -Wextra -O2 -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/test_mdct.dir/link.d CMakeFiles/test_mdct.dir/test_mdct.c.o -o test_mdct  ../src/libaether_codec.a ../src/libaether_transport.a -lbluetooth -lfftw3f -lm

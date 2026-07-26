@@ -1,2 +1,0 @@
-/usr/bin/ar qc libaether_transport.a CMakeFiles/aether_transport.dir/transport/aether_packet.c.o CMakeFiles/aether_transport.dir/transport/transport_rfcomm.c.o CMakeFiles/aether_transport.dir/transport/transport_tcp.c.o
-/usr/bin/ranlib libaether_transport.a
