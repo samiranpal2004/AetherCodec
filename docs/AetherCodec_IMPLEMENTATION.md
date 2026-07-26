@@ -2480,14 +2480,18 @@ Same per-frame decision for HQ, but applied to MDCT *coefficients*
 equivalent, and doing it after the MDCT keeps the decoder's overlap-add history
 in L/R space, letting the decision flip freely between frames.
 
-### 7.4 HQ frame batching (4 hops per packet)
+### 7.4 HQ frame batching (⚠️ REVERTED — see Phase 9)
 
 One hop per packet meant 187 packets/s at 96 kHz — ~36 kbps of header+CRC,
-15%+ of a weak link. The daemons now send `AETHER_HQ_HOPS_PER_PKT = 4` MDCT
+15%+ of a weak link. The daemons briefly sent `AETHER_HQ_HOPS_PER_PKT = 4` MDCT
 hops per packet (2048 samples, same duration as an NL frame). Measured
 (`test_codec_hq`): 598 → 569 kbps at *identical* SNR. The encoder accepts any
 multiple of `MDCT_HOP` up to `LPC_FRAME_SIZE`; the payload's leading
 `frame_samples` is the total, so the jitter buffer's level maths stay right.
+
+**This was reverted to 1 in Phase 9** — it caused audible HQ/auto stutter over
+Bluetooth. The wire format still supports batching and `test_codec_hq` still
+covers it; only the daemons' choice changed.
 
 ### 7.5 L2CAP SOCK_SEQPACKET transport (experimental, `--l2cap`)
 
@@ -2593,6 +2597,178 @@ still steps it down if that assumption ever breaks.
   retransmits add latency exactly when the network is worst. TCP is the right
   first move because it reuses the framing loop verbatim.
 - **Discovery.** No mDNS / Wi-Fi Direct; the receiver's IP is typed by hand.
+
+---
+
+## Phase 9 — HQ/auto stutter fix (2026-07-26)
+
+> **Report:** "previously perfect, now clear jitter in HQ and auto" over
+> **Bluetooth RFCOMM**, symptom = gaps/dropouts. NL unaffected. Two defects
+> introduced in Phase 7 were responsible; both only bite on a link constrained
+> enough to drop or stall packets, which is why single-machine tests and the
+> TCP path never showed them.
+
+### 9.1 What was ruled out first
+
+Worth recording, because the obvious suspects were wrong:
+
+| Hypothesis | Measurement | Verdict |
+|---|---|---|
+| HQ mid/side decision flipping frame to frame | 6 flips per 400 hops (2.8/s); SNR on flip hops **27.6 dB** vs 27.3 dB stable | not the cause |
+| Mid/side crushing the side channel (stereo flutter) | L−R SNR **24.8 dB** vs 27.3 dB overall — 2.5 dB gap | not the cause |
+| Encode CPU burst from batching / high SMR | **1.7%** of realtime at SMR 54 (0.36 ms per 21.3 ms packet) | not the cause |
+
+### 9.2 Root cause 1 — packet batching quadrupled the concealment gap
+
+`AETHER_HQ_HOPS_PER_PKT` **4 → 1**.
+
+A packet is the unit of loss *and* of concealment: when the send queue sheds
+one — exactly what a saturated Bluetooth link forces — the receiver fills that
+packet's whole duration with silence. At 4 hops every drop became a **21.3 ms
+hole instead of 5.3 ms**, four times the audible gap, in exchange for a 14%
+bitrate saving that does not prevent the drop. Dropped packets are what
+listeners hear; header bytes are not.
+
+This explains the symptom pattern exactly: NL's frame has always been 2048
+samples, so NL was untouched, and `auto` degraded only because its lower rungs
+are HQ.
+
+Verified end to end: sender now reports **`queue=5ms`** (was `21ms`) at
+~187 packets/s, `dropped=0 lost=0 underruns=0`.
+
+### 9.3 Root cause 2 — the stats reply blocked the audio thread
+
+`rfcomm_try_send_packet()` (new, `MSG_DONTWAIT`) now carries
+`CTRL_STATS_REPLY`; the report is skipped rather than queued if the socket is
+full.
+
+The receiver builds that report every 500 ms **on the thread that drains audio
+into the playback ring**, and it used the blocking `rfcomm_send_packet`. On
+Bluetooth the reverse direction competes for airtime with the forward stream,
+so it congests precisely when the stream is already struggling — the send
+parks, packet intake stalls, the sender's socket backs up, its queue sheds
+frames, and the listener hears a gap. A stats report causing the very loss it
+exists to report.
+
+Dropping a report is free: the sender treats anything older than 2 s as "no
+data" and drives ABR from send-queue backpressure instead.
+
+### ✅ Phase 9 Checkpoint
+
+- [x] `ctest` 10/10, clean build — batched format still covered by
+      `test_codec_hq`, so wire-format support is unchanged and re-raising the
+      constant stays a one-line change
+- [x] HQ end-to-end: `queue=5ms` (was 21 ms), `dropped=0 lost=0 underruns=0
+      overflow=0` over 60 s
+- [ ] Two-laptop Bluetooth re-test of `--mode hq` and `--mode auto` — needs
+      second laptop
+
+> **Standing caveat.** These fixes remove the *added* stutter, but the SMR
+> controller still drives HQ to ~**882 kbps** at its 54 dB ceiling, which no
+> measured RFCOMM link here carries. Bluetooth remains the wrong transport for
+> this codec; `--tcp` (Phase 8) is what actually delivers NL/HQ cleanly.
+
+---
+
+## Phase 10 — Periodic mid-playback breaks (2026-07-26)
+
+> **Report:** after Phase 9 the music plays properly, but "in the middle of
+> playback it breaks", and in `auto` it breaks frequently. Session logs over
+> RFCOMM showed two independent oscillators, both of the same shape: a control
+> loop that climbs until it fails, breaks the audio, backs off, and climbs
+> again — forever. Neither was a bug in the sense of wrong code; both were
+> control loops with **no memory of failure**.
+
+### 10.1 Oscillator 1 — the SMR sawtooth (fixed `--mode hq`)
+
+From the log, one full cycle roughly every 25 s:
+
+```
+smr=12 -> 15 -> 20 -> 27 -> 35 -> 45 -> 53 -> 54     (queue 5 ms, climbing)
+smr=54  queue=175ms -> 389ms   dropped 68 -> 82       <-- BREAK
+smr=52 -> 40 -> 29 -> 22 -> 20  (queue drains)
+smr=20 -> 25 -> 31 -> 40 -> 50 -> 54                  (climbs again)
+        queue=287ms -> 474ms   dropped 82 -> 115      <-- BREAK
+```
+
+`abr_smr_step()` is pure AIMD: whenever the queue is low it climbs, capped only
+by the absolute `ABR_SMR_MAX_DB` (54 dB ≈ 880 kbps). On a link that sustains
+~700 kbps it therefore *had* to overshoot to discover the limit — and the
+overshoot is what the listener hears.
+
+**Fix: `SmrCtrl`, an AIMD loop with congestion memory.** On congestion the
+ceiling drops to `ABR_SMR_BACKOFF_DB` below wherever it broke and climbing is
+capped there; the ceiling lifts again only by `ABR_SMR_PROBE_DB` after
+`ABR_SMR_PROBE_TICKS` of a genuinely clean queue. Repeated congestion ratchets
+it down, so it converges on the level the link actually holds.
+
+### 10.2 Oscillator 2 — the ladder flip-flop (`--mode auto`)
+
+```
+HQ-48k -> HQ-96k (RSSI -18)   ... 5 s ... queue=277ms -> congested -> HQ-48k   dropped +51
+HQ-48k -> HQ-96k              ... 5 s ... queue=261ms -> congested -> HQ-48k   dropped +52
+```
+— every ~20–25 s, all session. RSSI was excellent throughout (−12 to −20 dBm),
+so `abr_classify` always wanted the top rung; the congestion ceiling relaxed on
+a **fixed** `ABR_PROBE_INTERVAL_MS` timer, and each switch flushes the send
+queue, which is itself a gap.
+
+**Fix: exponential probe backoff.** `probe_ms` doubles on each failed probe up
+to `ABR_PROBE_MAX_MS` (~5 min) and resets only after `ABR_PROBE_RESET_MS` of
+clean running. A link that can carry the higher rung still gets there; one that
+cannot stops asking. Measured in `test_abr`: **6 retries per 10 min instead of
+~30**.
+
+### 10.3 Contributing cause — SMR carried across a rung change
+
+```
+[abr] HQ-48kHz -> HQ-96kHz
+[stats] frames=5800  0.3s  839 kbps  smr=54dB  link=851 kbps
+```
+
+At a fixed SMR, HQ-96k costs roughly twice HQ-48k. Carrying an SMR that had
+just maxed out at 48 kHz straight into 96 kHz put ~840 kbps on the link within
+one tick of the switch — the upgrade reliably undid itself. The sender now
+re-enters every rung at `ABR_SMR_ENTRY_DB` (30 dB) and climbs from there.
+
+`link_headroom` also now compares against the controller's *learned* ceiling
+rather than `ABR_SMR_MAX_DB`; otherwise a link that never reaches 54 dB would
+report "no headroom" forever and the ladder could never climb back after a dip.
+
+### 10.4 Why the existing test missed all of this
+
+`test_abr`'s convergence check asserted the queue stays below
+`ABR_QUEUE_HIGH_MS` for most of the run — which **a sawtooth satisfies**, since
+the queue is drained for most of every cycle. The fault was invisible to it.
+
+The new check asserts on **SMR stability** instead, which is what the listener
+experiences: over the back half of a 5-minute simulated run the spread must be
+≤ 8 dB and the link must flood **zero** times. Measured after the fix:
+
+| Link | SMR spread | Floods | Learned ceiling |
+|---|---|---|---|
+| 900 kbps | 3.0 dB | 0 | 37.6 dB |
+| 520 kbps | 3.0 dB | 0 | 23.0 dB |
+| 300 kbps | 3.0 dB | 0 | 14.5 dB |
+
+(Before: a 12 → 54 dB swing, i.e. a ~42 dB span, flooding once per cycle.)
+
+### ✅ Phase 10 Checkpoint
+
+- [x] `ctest` 10/10, clean build
+- [x] SMR settles within 3.0 dB with zero floods on 900 / 520 / 300 kbps links
+- [x] A rung that keeps failing is retried 6x per 10 min, not ~30x
+- [x] TCP loopback regression: `smr` pins at 54 with `queue=5ms dropped=0
+      lost=0 underruns=0` — on a link with real capacity the ceiling correctly
+      never engages
+- [ ] Two-laptop Bluetooth re-test of `--mode hq` and `--mode auto` — needs
+      second laptop
+
+> **Still true.** These fixes stop the codec from *causing* breaks by
+> repeatedly overshooting. They do not create bandwidth: HQ will now settle at
+> whatever quality the Bluetooth link sustains (~500–700 kbps here) and stay
+> there, which is the honest best available. `--tcp` remains the way to get
+> full quality.
 
 ---
 

@@ -183,6 +183,29 @@ int rfcomm_send_packet(RFCOMMTransport *t, const AetherPacket *pkt) {
     return 0;
 }
 
+int rfcomm_try_send_packet(RFCOMMTransport *t, const AetherPacket *pkt) {
+    int n = aether_packet_pack(pkt, t->tx_buf, sizeof(t->tx_buf));
+    if (n < 0) return -1;
+
+    /* One shot, non-blocking. A partial write is not an option on a stream
+       socket here: finishing it would mean blocking, which is the whole thing
+       we are avoiding, and half a packet would desynchronise the peer's
+       framing. So send atomically or not at all — MSG_DONTWAIT gives us
+       exactly that for a packet this small (tens of bytes, far under any
+       socket buffer). */
+    for (;;) {
+        int r = (int)send(t->conn_fd, t->tx_buf, (size_t)n,
+                          MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 1;
+        if (r < 0) return -1;
+        if (r != n) return 1;    /* truncated: treat as skipped, never resume */
+        break;
+    }
+    t->tx_bytes += (unsigned long)n;
+    return 0;
+}
+
 unsigned long rfcomm_tx_bytes(const RFCOMMTransport *t) {
     return t ? t->tx_bytes : 0;
 }

@@ -124,11 +124,43 @@ int main(void) {
     assert(abr_current_state(a) == ABR_STATE_HQ_96K);
     printf("\xE2\x9C\x93 abr: does not oscillate back into the congested mode\n");
 
-    /* After the probe interval, it may cautiously climb one rung again. */
-    t += ABR_PROBE_INTERVAL_MS;
+    /* After the probe interval, it may cautiously climb one rung again. The
+       wait is not the base interval: each congestion event doubles it, and two
+       have happened above (20s -> 40s -> 80s), so allow 4x the base. */
+    t += 4 * ABR_PROBE_INTERVAL_MS;
     for (int i = 0; i < 5; i++) { abr_update_congested(a, -50, 0.0f, 0, t); t += TICK_MS; }
     assert(abr_current_state(a) < ABR_STATE_HQ_96K);
     printf("\xE2\x9C\x93 abr: probes back up after the backoff interval\n");
+    abr_ctrl_destroy(a);
+
+    /* --- repeated failure must back off, not retry forever ----------------
+       Regression for the `HQ-48k -> HQ-96k -> congested -> HQ-48k` loop seen on
+       a real link: a rung that does not fit was retried on a FIXED 20 s timer
+       for the whole session, and every retry flushed the send queue and broke
+       the audio. Each failed probe must now buy a longer silence before the
+       next attempt. Measured as: how many probe attempts happen in a fixed
+       stretch of wall-clock time where the upper rung always re-congests. */
+    a = abr_ctrl_create(NULL, NULL);
+    t = 0;
+    int attempts = 0;
+    ABRState prev = abr_current_state(a);
+    /* 10 minutes of a link that always fails the rung above. */
+    for (uint64_t end = t + 600000; t < end; t += TICK_MS) {
+        ABRState before_tick = abr_current_state(a);
+        /* Congested only when sitting above the bottom rung — i.e. the probe
+           immediately fails, exactly like the logged HQ-96k behaviour. */
+        int congested = (before_tick < ABR_STATE_HQ_48K);
+        abr_update_congested(a, -50, 0.0f, congested, t);
+        ABRState now = abr_current_state(a);
+        if (now < before_tick) attempts++;      /* climbed = a probe attempt */
+        prev = now;
+    }
+    (void)prev;
+    /* A fixed 20 s timer would give ~30 attempts (and ~30 audible breaks) in
+       10 minutes; doubling backoff must keep it to a handful. */
+    assert(attempts <= 6);
+    printf("\xE2\x9C\x93 abr: a rung that keeps failing is retried %d times in 10 min "
+           "(fixed timer would be ~30)\n", attempts);
     abr_ctrl_destroy(a);
 
     /* --- headroom gates the probe ----------------------------------------
@@ -244,6 +276,48 @@ int main(void) {
         printf("\xE2\x9C\x93 abr: rate control settles at SMR %4.1f dB "
                "(~%.0f kbps) on a %.0f kbps link\n",
                smr, final_kbps, capacity[c]);
+    }
+
+    /* --- the SMR controller must SETTLE, not oscillate --------------------
+       The convergence check above passes even for a controller that sawtooths,
+       because the queue is drained most of the time either way — which is
+       exactly how the real fault hid. On a real 700 kbps RFCOMM link the raw
+       AIMD loop ran SMR 12 -> 54 -> flood -> 12 on a ~25 s cycle for the whole
+       session, and every peak dropped a burst of packets: a break in the music
+       roughly twice a minute. So assert on SMR STABILITY, which is what the
+       listener actually experiences.
+
+       Same link model as above, but measuring the spread of SMR over the back
+       half of the run once the controller has had time to learn. */
+    for (int c = 0; c < 3; c++) {
+        const float capacity[3] = { 900.0f, 520.0f, 300.0f };
+        SmrCtrl ctl;
+        smr_ctrl_init(&ctl, ABR_SMR_ENTRY_DB);
+        float queue = 0.0f;
+        float lo = 1e9f, hi = -1e9f;
+        int   floods = 0;
+
+        for (int i = 0; i < 1200; i++) {          /* 1200 ticks = 5 min */
+            float kbps = kbps_at_min + (ctl.smr - ABR_SMR_MIN_DB) * kbps_per_db;
+            queue += (kbps - capacity[c]) / capacity[c] * TICK_MS;
+            if (queue < 0.0f) queue = 0.0f;
+            int drops = 0;
+            if (queue > 500.0f) { queue = 500.0f; drops = 1; }
+            smr_ctrl_step(&ctl, (int)queue, drops);
+
+            if (i > 600) {                        /* back half: must be settled */
+                if (ctl.smr < lo) lo = ctl.smr;
+                if (ctl.smr > hi) hi = ctl.smr;
+                if (drops) floods++;
+            }
+        }
+        /* A sawtooth spans tens of dB; a settled controller barely moves. */
+        assert(hi - lo <= 8.0f);
+        /* And it must stop flooding the link once it has learned the limit. */
+        assert(floods == 0);
+        printf("\xE2\x9C\x93 abr: SMR settles within %.1f dB and floods 0 times over "
+               "the last 2.5 min on a %.0f kbps link (ceiling learned %.1f dB)\n",
+               hi - lo, capacity[c], ctl.ceiling);
     }
 
     printf("\nAll ABR tests passed.\n");

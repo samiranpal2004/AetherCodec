@@ -12,6 +12,8 @@ struct ABRCtrl {
     ABRState     min_state;        /* best (numerically lowest) state allowed;
                                       raised by congestion, relaxed over time */
     uint64_t     relax_ms;         /* next time min_state may relax one step */
+    uint64_t     probe_ms;         /* current probe interval; doubles on failure */
+    uint64_t     last_congest_ms;  /* when congestion was last seen */
     int          headroom;         /* sender reports real spare capacity */
     ABRCallback  callback;
     void        *userdata;
@@ -56,6 +58,45 @@ float abr_smr_step(float smr_db, int queue_ms, int dropped) {
     return smr_db;
 }
 
+void smr_ctrl_init(SmrCtrl *c, float start_db) {
+    if (!c) return;
+    if (start_db < ABR_SMR_MIN_DB) start_db = ABR_SMR_MIN_DB;
+    if (start_db > ABR_SMR_MAX_DB) start_db = ABR_SMR_MAX_DB;
+    c->smr         = start_db;
+    c->ceiling     = ABR_SMR_MAX_DB;   /* fully open until the link says otherwise */
+    c->clean_ticks = 0;
+}
+
+float smr_ctrl_step(SmrCtrl *c, int queue_ms, int dropped) {
+    int congested = dropped || queue_ms > ABR_QUEUE_HIGH_MS;
+
+    if (congested) {
+        /* Record the failure. The level we were sitting at is demonstrably too
+           high for this link, so cap below it; the queue lags the bitrate that
+           caused it, hence a margin rather than the exact value. Repeated
+           congestion ratchets the cap down further, so it converges from above
+           on whatever the link genuinely holds. */
+        float cap = c->smr - ABR_SMR_BACKOFF_DB;
+        if (cap < ABR_SMR_MIN_DB) cap = ABR_SMR_MIN_DB;
+        if (cap < c->ceiling) c->ceiling = cap;
+        c->clean_ticks = 0;
+    } else if (queue_ms < ABR_QUEUE_LOW_MS) {
+        /* Probe upward only after a sustained clean stretch, and only a little:
+           a probe that fails costs a dropout, so it must be rare and small.
+           This is the slow path back up if the link genuinely improves. */
+        if (++c->clean_ticks >= ABR_SMR_PROBE_TICKS &&
+            c->ceiling < ABR_SMR_MAX_DB) {
+            c->ceiling += ABR_SMR_PROBE_DB;
+            if (c->ceiling > ABR_SMR_MAX_DB) c->ceiling = ABR_SMR_MAX_DB;
+            c->clean_ticks = 0;
+        }
+    }
+
+    c->smr = abr_smr_step(c->smr, queue_ms, dropped);
+    if (c->smr > c->ceiling) c->smr = c->ceiling;
+    return c->smr;
+}
+
 ABRState abr_classify(int rssi_dbm, float loss_pct) {
     if (rssi_dbm > -65 && loss_pct < 1.0f) return ABR_STATE_NL_96K;
     if (rssi_dbm > -75 && loss_pct < 3.0f) return ABR_STATE_NL_48K;
@@ -70,6 +111,7 @@ ABRCtrl* abr_ctrl_create(ABRCallback cb, void *userdata) {
     abr->callback = cb;
     abr->userdata = userdata;
     abr->headroom = 1;                  /* assume spare capacity until told otherwise */
+    abr->probe_ms = ABR_PROBE_INTERVAL_MS;
     return abr;
 }
 
@@ -86,7 +128,8 @@ void abr_start_at(ABRCtrl *abr, ABRState state, uint64_t now_ms) {
        throughput, and jumping straight to NL-96k on a link that cannot carry
        it is exactly the startup flood this function exists to prevent. */
     abr->min_state      = state;
-    abr->relax_ms       = now_ms + ABR_PROBE_INTERVAL_MS;
+    abr->probe_ms       = ABR_PROBE_INTERVAL_MS;
+    abr->relax_ms       = now_ms + abr->probe_ms;
     abr->last_switch_ms = now_ms;
     abr->have_switched  = 1;   /* the first upgrade honours the normal hold */
 }
@@ -147,10 +190,17 @@ void abr_update_congested(ABRCtrl *abr, int rssi_dbm, float loss_pct,
        fills the send queue and costs an audible blip before it backs off again.
        `headroom` defaults to 1, so a caller that never sets it keeps the plain
        timer behaviour. */
+    /* A long clean stretch means conditions may genuinely have changed (the
+       laptops moved closer, interference stopped), so forget the accumulated
+       backoff and be willing to probe promptly again. */
+    if (abr->last_congest_ms && !congested &&
+        now_ms - abr->last_congest_ms >= ABR_PROBE_RESET_MS)
+        abr->probe_ms = ABR_PROBE_INTERVAL_MS;
+
     if (abr->min_state > ABR_STATE_NL_96K && now_ms >= abr->relax_ms &&
         abr->headroom && !congested) {
         abr->min_state--;
-        abr->relax_ms = now_ms + ABR_PROBE_INTERVAL_MS;
+        abr->relax_ms = now_ms + abr->probe_ms;
     }
 
     ABRState target = abr_classify(rssi_dbm, loss_pct);
@@ -161,7 +211,13 @@ void abr_update_congested(ABRCtrl *abr, int rssi_dbm, float loss_pct,
         ABRState worse = (ABRState)(abr->current + 1);
         if (worse > ABR_STATE_HQ_48K) worse = ABR_STATE_HQ_48K;
         if (worse > abr->min_state) abr->min_state = worse;
-        abr->relax_ms = now_ms + ABR_PROBE_INTERVAL_MS;
+        /* Each failed probe doubles the wait before the next one. Without this
+           a rung that simply does not fit is retried on a fixed timer forever,
+           and every retry is an audible break. */
+        abr->probe_ms *= 2;
+        if (abr->probe_ms > ABR_PROBE_MAX_MS) abr->probe_ms = ABR_PROBE_MAX_MS;
+        abr->relax_ms       = now_ms + abr->probe_ms;
+        abr->last_congest_ms = now_ms;
     }
 
     if (target < abr->min_state) target = abr->min_state;   /* clamp to allowed */

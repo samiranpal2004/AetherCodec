@@ -59,7 +59,16 @@ static int ring_write_frames(AudioRing *r, const int32_t *pcm, uint32_t frames) 
 
 /* Compose and send one CTRL_STATS_REPLY. Runs on the recv thread between
    packets, so it shares the socket safely with the recv path (opposite
-   directions, separate transport buffers). */
+   directions, separate transport buffers).
+
+   The send is NON-BLOCKING and the report is dropped if the socket is full.
+   This thread is the one that drains audio into the playback ring, so it must
+   never park in send(): on Bluetooth the reverse direction competes for
+   airtime with the audio stream, so a blocking report stalls intake precisely
+   when the link is already saturated, which backs the sender up until its
+   queue sheds frames — audible as the gaps the report exists to warn about.
+   Losing a report costs nothing: the sender treats anything older than 2 s as
+   "no data" and drives ABR from send-queue backpressure instead. */
 static void send_stats_reply(RFCOMMTransport *t, uint32_t *ctrl_seq,
                              unsigned long got, unsigned long lost,
                              unsigned long wgot, unsigned long wlost,
@@ -83,7 +92,7 @@ static void send_stats_reply(RFCOMMTransport *t, uint32_t *ctrl_seq,
     pkt.hdr.mode         = AETHER_MODE_CTRL;
     pkt.hdr.payload_size = (uint16_t)sizeof(sr);
     memcpy(pkt.payload, &sr, sizeof(sr));
-    rfcomm_send_packet(t, &pkt);   /* best-effort; a failure ends the stream anyway */
+    rfcomm_try_send_packet(t, &pkt);   /* best-effort; never blocks this thread */
 }
 
 int main(int argc, char *argv[]) {

@@ -532,6 +532,9 @@ int main(int argc, char *argv[]) {
     int           over_budget_warned = 0;
 
     /* HQ rate controller + link-throughput measurement state. */
+    SmrCtrl       smr_ctl;
+    smr_ctrl_init(&smr_ctl, ABR_SMR_ENTRY_DB);
+    mdct_set_smr_db(smr_ctl.smr);
     uint64_t      rate_last_us    = seg_start_us;
     unsigned long rate_last_drop  = 0;
     unsigned long link_last_bytes = 0;
@@ -556,6 +559,15 @@ int main(int argc, char *argv[]) {
                    operating point — see sendq_flush. On an upgrade the queue
                    is near-empty anyway, so flushing unconditionally is fine. */
                 if (!loopback) sendq_flush(&g_sendq);
+                /* Restart the rate controller for the new operating point. The
+                   old rung's SMR is not transferable: at a fixed SMR, HQ-96k
+                   costs roughly twice HQ-48k, so carrying an SMR that had just
+                   maxed out at 48 kHz straight into 96 kHz put ~840 kbps onto
+                   the link within one tick of the switch and flooded the queue
+                   immediately — the upgrade undid itself every time. Re-enter
+                   each rung low and let it earn its quality back. */
+                smr_ctrl_init(&smr_ctl, ABR_SMR_ENTRY_DB);
+                mdct_set_smr_db(smr_ctl.smr);
                 seg_frames = 0; seg_bytes = 0;
                 seg_start_us = aether_timestamp_us();
             }
@@ -572,14 +584,21 @@ int main(int argc, char *argv[]) {
                 rate_last_drop = drops;
 
                 if (mode == AETHER_MODE_HQ)
-                    mdct_set_smr_db(abr_smr_step(mdct_get_smr_db(), depth, behind));
+                    mdct_set_smr_db(smr_ctrl_step(&smr_ctl, depth, behind));
 
                 /* Real spare capacity: queue empty and nothing left to spend it
-                   on. In NL there is no quality knob, so the queue alone says it. */
+                   on. In NL there is no quality knob, so the queue alone says it.
+                   In HQ the test is against the controller's LEARNED ceiling,
+                   not the absolute maximum: once the link has shown it cannot
+                   hold more, sitting at that learned limit with a dry queue is
+                   exactly what "no quality left to spend" means. Comparing to
+                   ABR_SMR_MAX_DB instead would report no headroom forever on
+                   any link that never reaches 54 dB, so the ladder could never
+                   climb back after a dip. */
                 atomic_store(&link_headroom,
                              depth < ABR_QUEUE_LOW_MS &&
                              (mode == AETHER_MODE_NL ||
-                              mdct_get_smr_db() >= ABR_SMR_MAX_DB - 0.01f));
+                              smr_ctl.smr >= smr_ctl.ceiling - 0.01f));
 
                 /* Sustained link throughput: send() blocks once the kernel
                    buffer is full, so this is what the air interface really
