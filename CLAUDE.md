@@ -120,6 +120,23 @@ don't "fix" them back to match the prose:
   the queue, not the constant, stops the climb, so spare link capacity becomes
   quality. The increase is two-tier (+1.2 dB/tick while the queue is idle,
   +0.4 near capacity) so recovery from a congestion cut doesn't take ~26 s.
+- **Drive SMR through `SmrCtrl`/`smr_ctrl_step`, never `abr_smr_step` directly.**
+  Raw AIMD has no memory of failure: it climbs to the 54 dB ceiling, floods,
+  drops frames, cuts, repeats — a ~25 s sawtooth that broke the audio about
+  twice a minute on a real link. `SmrCtrl` caps the climb at a ceiling learned
+  from where congestion actually happened. Re-enter every rung at
+  `ABR_SMR_ENTRY_DB`: at fixed SMR, HQ-96k costs ~2x HQ-48k, so carrying a
+  maxed-out 48k SMR into 96k floods within one tick of the switch.
+  `link_headroom` must compare against the *learned* ceiling, not
+  `ABR_SMR_MAX_DB`, or a link that never reaches 54 dB reports no headroom
+  forever and the ladder can never climb back after a dip.
+- **ABR probe backoff is exponential**, not a fixed timer: a rung that doesn't
+  fit was otherwise retried every 20 s forever, and every retry flushes the
+  send queue — an audible break. `probe_ms` doubles per failed probe up to
+  `ABR_PROBE_MAX_MS`, resetting after `ABR_PROBE_RESET_MS` of clean running.
+- **Test ABR on SMR *stability*, not queue depth.** A sawtoothing controller
+  keeps the queue drained most of the time, so the old "queue stayed low" check
+  passed straight through the fault that was audibly breaking playback.
 - HQ entropy stage is **Rice, not Huffman** — the HLD's "fixed tables v1.0" are
   never specified anywhere, so untrained tables would be arbitrary.
 - **HQ payload carries a 64-bit band mask** (not in the HLD): Rice never codes a

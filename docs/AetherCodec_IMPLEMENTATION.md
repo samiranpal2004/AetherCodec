@@ -2670,6 +2670,108 @@ data" and drives ABR from send-queue backpressure instead.
 
 ---
 
+## Phase 10 — Periodic mid-playback breaks (2026-07-26)
+
+> **Report:** after Phase 9 the music plays properly, but "in the middle of
+> playback it breaks", and in `auto` it breaks frequently. Session logs over
+> RFCOMM showed two independent oscillators, both of the same shape: a control
+> loop that climbs until it fails, breaks the audio, backs off, and climbs
+> again — forever. Neither was a bug in the sense of wrong code; both were
+> control loops with **no memory of failure**.
+
+### 10.1 Oscillator 1 — the SMR sawtooth (fixed `--mode hq`)
+
+From the log, one full cycle roughly every 25 s:
+
+```
+smr=12 -> 15 -> 20 -> 27 -> 35 -> 45 -> 53 -> 54     (queue 5 ms, climbing)
+smr=54  queue=175ms -> 389ms   dropped 68 -> 82       <-- BREAK
+smr=52 -> 40 -> 29 -> 22 -> 20  (queue drains)
+smr=20 -> 25 -> 31 -> 40 -> 50 -> 54                  (climbs again)
+        queue=287ms -> 474ms   dropped 82 -> 115      <-- BREAK
+```
+
+`abr_smr_step()` is pure AIMD: whenever the queue is low it climbs, capped only
+by the absolute `ABR_SMR_MAX_DB` (54 dB ≈ 880 kbps). On a link that sustains
+~700 kbps it therefore *had* to overshoot to discover the limit — and the
+overshoot is what the listener hears.
+
+**Fix: `SmrCtrl`, an AIMD loop with congestion memory.** On congestion the
+ceiling drops to `ABR_SMR_BACKOFF_DB` below wherever it broke and climbing is
+capped there; the ceiling lifts again only by `ABR_SMR_PROBE_DB` after
+`ABR_SMR_PROBE_TICKS` of a genuinely clean queue. Repeated congestion ratchets
+it down, so it converges on the level the link actually holds.
+
+### 10.2 Oscillator 2 — the ladder flip-flop (`--mode auto`)
+
+```
+HQ-48k -> HQ-96k (RSSI -18)   ... 5 s ... queue=277ms -> congested -> HQ-48k   dropped +51
+HQ-48k -> HQ-96k              ... 5 s ... queue=261ms -> congested -> HQ-48k   dropped +52
+```
+— every ~20–25 s, all session. RSSI was excellent throughout (−12 to −20 dBm),
+so `abr_classify` always wanted the top rung; the congestion ceiling relaxed on
+a **fixed** `ABR_PROBE_INTERVAL_MS` timer, and each switch flushes the send
+queue, which is itself a gap.
+
+**Fix: exponential probe backoff.** `probe_ms` doubles on each failed probe up
+to `ABR_PROBE_MAX_MS` (~5 min) and resets only after `ABR_PROBE_RESET_MS` of
+clean running. A link that can carry the higher rung still gets there; one that
+cannot stops asking. Measured in `test_abr`: **6 retries per 10 min instead of
+~30**.
+
+### 10.3 Contributing cause — SMR carried across a rung change
+
+```
+[abr] HQ-48kHz -> HQ-96kHz
+[stats] frames=5800  0.3s  839 kbps  smr=54dB  link=851 kbps
+```
+
+At a fixed SMR, HQ-96k costs roughly twice HQ-48k. Carrying an SMR that had
+just maxed out at 48 kHz straight into 96 kHz put ~840 kbps on the link within
+one tick of the switch — the upgrade reliably undid itself. The sender now
+re-enters every rung at `ABR_SMR_ENTRY_DB` (30 dB) and climbs from there.
+
+`link_headroom` also now compares against the controller's *learned* ceiling
+rather than `ABR_SMR_MAX_DB`; otherwise a link that never reaches 54 dB would
+report "no headroom" forever and the ladder could never climb back after a dip.
+
+### 10.4 Why the existing test missed all of this
+
+`test_abr`'s convergence check asserted the queue stays below
+`ABR_QUEUE_HIGH_MS` for most of the run — which **a sawtooth satisfies**, since
+the queue is drained for most of every cycle. The fault was invisible to it.
+
+The new check asserts on **SMR stability** instead, which is what the listener
+experiences: over the back half of a 5-minute simulated run the spread must be
+≤ 8 dB and the link must flood **zero** times. Measured after the fix:
+
+| Link | SMR spread | Floods | Learned ceiling |
+|---|---|---|---|
+| 900 kbps | 3.0 dB | 0 | 37.6 dB |
+| 520 kbps | 3.0 dB | 0 | 23.0 dB |
+| 300 kbps | 3.0 dB | 0 | 14.5 dB |
+
+(Before: a 12 → 54 dB swing, i.e. a ~42 dB span, flooding once per cycle.)
+
+### ✅ Phase 10 Checkpoint
+
+- [x] `ctest` 10/10, clean build
+- [x] SMR settles within 3.0 dB with zero floods on 900 / 520 / 300 kbps links
+- [x] A rung that keeps failing is retried 6x per 10 min, not ~30x
+- [x] TCP loopback regression: `smr` pins at 54 with `queue=5ms dropped=0
+      lost=0 underruns=0` — on a link with real capacity the ceiling correctly
+      never engages
+- [ ] Two-laptop Bluetooth re-test of `--mode hq` and `--mode auto` — needs
+      second laptop
+
+> **Still true.** These fixes stop the codec from *causing* breaks by
+> repeatedly overshooting. They do not create bandwidth: HQ will now settle at
+> whatever quality the Bluetooth link sustains (~500–700 kbps here) and stay
+> there, which is the honest best available. `--tcp` remains the way to get
+> full quality.
+
+---
+
 ## Quick Reference: Build & Run
 
 ```bash

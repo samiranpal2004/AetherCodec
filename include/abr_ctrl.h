@@ -34,8 +34,19 @@ typedef enum {
 
 /* After congestion forces a downgrade, how long before the engine probes one
    step back up. Long, so a link that simply can't carry a mode doesn't keep
-   retrying it (each retry is an audible blip). */
+   retrying it (each retry is an audible blip).
+
+   A FIXED interval is not enough on its own: if the rung above genuinely does
+   not fit, a constant timer retries it forever — measured as `HQ-48k -> HQ-96k
+   -> congested -> HQ-48k` cycling every ~20 s for the whole session, each
+   cycle flushing the send queue and costing an audible break. So the interval
+   doubles on every failed probe up to ABR_PROBE_MAX_MS, and resets only after
+   the link has stayed clean long enough to suggest conditions really changed.
+   A link that can carry the higher rung still gets there; one that cannot
+   stops asking. */
 #define ABR_PROBE_INTERVAL_MS     20000
+#define ABR_PROBE_MAX_MS         320000   /* ~5 min between hopeless retries  */
+#define ABR_PROBE_RESET_MS       120000   /* clean this long => forget backoff */
 
 /* ---- HQ rate control ----------------------------------------------------
    The four-rung ladder above is coarse: each step roughly halves the demand.
@@ -74,10 +85,49 @@ typedef enum {
    step. In fixed --mode hq there is no ladder, and the sender warns instead. */
 #define ABR_SMR_MIN_DB    12.0f
 
-/* One control tick. `queue_ms` is the sender's queued audio depth and
+/* One raw AIMD tick. `queue_ms` is the sender's queued audio depth and
    `dropped` is non-zero if any frame was dropped since the previous tick.
-   Returns the new SMR, clamped to [ABR_SMR_MIN_DB, ABR_SMR_MAX_DB]. */
+   Returns the new SMR, clamped to [ABR_SMR_MIN_DB, ABR_SMR_MAX_DB].
+
+   Use SmrCtrl below rather than calling this directly: on its own this climbs
+   to ABR_SMR_MAX_DB every time the queue drains, which on a link that cannot
+   sustain the top of the range means re-discovering the limit by overshooting
+   it, forever. */
 float abr_smr_step(float smr_db, int queue_ms, int dropped);
+
+/* ---- SMR controller with congestion memory ------------------------------
+   Raw AIMD has no memory: whenever the queue drains it climbs back to
+   ABR_SMR_MAX_DB, floods the link, drops frames, cuts, and repeats. Measured
+   on a real RFCOMM link that was the dominant audible fault — a ~25 s sawtooth
+   (SMR 12 -> 54 -> flood -> 12) where every peak cost a burst of dropped
+   packets, i.e. a break in the music roughly twice a minute, indefinitely.
+   The queue spends most of its time drained either way, so a naive "did the
+   queue stay low?" check does NOT catch this; only SMR stability does.
+
+   The cure is to remember the level that failed and refuse to climb back into
+   it: on congestion the ceiling drops to a margin below wherever it broke, and
+   it is raised again only in small steps after a long, genuinely clean stretch.
+   That turns the sawtooth into convergence — it finds the level the link can
+   actually hold and stays there, which is what the listener wants. */
+/* SMR to (re-)enter a rung at. Deliberately mid-range rather than the top:
+   entering high floods the link before the controller's first tick can react,
+   and the climb from here is fast while the queue is dry. */
+#define ABR_SMR_ENTRY_DB    30.0f
+#define ABR_SMR_BACKOFF_DB   3.0f  /* cap this far below where it congested   */
+#define ABR_SMR_PROBE_DB     0.5f  /* how much to lift the cap when probing   */
+#define ABR_SMR_PROBE_TICKS   40   /* clean ticks required first (~10 s)      */
+
+typedef struct {
+    float smr;          /* current signal-to-mask ratio, dB     */
+    float ceiling;      /* learned safe cap, <= ABR_SMR_MAX_DB  */
+    int   clean_ticks;  /* consecutive ticks with a drained queue */
+} SmrCtrl;
+
+/* start_db is the SMR to begin at; the ceiling starts fully open. */
+void  smr_ctrl_init(SmrCtrl *c, float start_db);
+
+/* One tick, same inputs as abr_smr_step, but ceiling-aware. */
+float smr_ctrl_step(SmrCtrl *c, int queue_ms, int dropped);
 
 typedef struct ABRCtrl ABRCtrl;
 
