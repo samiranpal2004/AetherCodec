@@ -9,6 +9,12 @@
 *.wav
 spectra_comparison.png
 *_spec.png
+benchmark_results.md
+benchmark_spectra.png
+
+# Benchmark harness python env (tools/benchmark.sh picks this up automatically)
+.venv-bench/
+__pycache__/
 
 # Editor / OS
 .vscode/
