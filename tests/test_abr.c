@@ -108,6 +108,144 @@ int main(void) {
     printf("\xE2\x9C\x93 abr: walking away steps NL-96k -> NL-48k -> HQ-96k -> HQ-48k\n");
     abr_ctrl_destroy(a);
 
+    /* --- 8. backpressure: strong RSSI but congested link must step down ---- */
+    a = abr_ctrl_create(NULL, NULL);
+    t = 0;
+    /* RSSI says NL-96k is fine, but the send queue is backing up. */
+    abr_update_congested(a, -50, 0.0f, 1, t); t += TICK_MS;
+    assert(abr_current_state(a) == ABR_STATE_NL_48K);   /* immediate 1-step drop */
+    abr_update_congested(a, -50, 0.0f, 1, t); t += TICK_MS;
+    assert(abr_current_state(a) == ABR_STATE_HQ_96K);   /* still congested: again */
+    printf("\xE2\x9C\x93 abr: congestion steps down despite strong RSSI\n");
+
+    /* Congestion clears, RSSI still great — must NOT immediately climb back into
+       the mode that just failed (would re-congest and blip). */
+    for (int i = 0; i < 12; i++) { abr_update_congested(a, -50, 0.0f, 0, t); t += TICK_MS; }
+    assert(abr_current_state(a) == ABR_STATE_HQ_96K);
+    printf("\xE2\x9C\x93 abr: does not oscillate back into the congested mode\n");
+
+    /* After the probe interval, it may cautiously climb one rung again. */
+    t += ABR_PROBE_INTERVAL_MS;
+    for (int i = 0; i < 5; i++) { abr_update_congested(a, -50, 0.0f, 0, t); t += TICK_MS; }
+    assert(abr_current_state(a) < ABR_STATE_HQ_96K);
+    printf("\xE2\x9C\x93 abr: probes back up after the backoff interval\n");
+    abr_ctrl_destroy(a);
+
+    /* --- headroom gates the probe ----------------------------------------
+       Relaxing the ceiling purely on the timer means re-probing a mode the link
+       has already proven it cannot carry, forever, at one audible blip per
+       interval. With no reported headroom the ceiling must hold. */
+    a = abr_ctrl_create(NULL, NULL);
+    t = 0;
+    abr_update_congested(a, -50, 0.0f, 1, t); t += TICK_MS;
+    abr_update_congested(a, -50, 0.0f, 1, t); t += TICK_MS;
+    ABRState settled = abr_current_state(a);
+    assert(settled > ABR_STATE_NL_96K);
+
+    abr_set_headroom(a, 0);
+    for (int i = 0; i < 200; i++) {          /* far past several probe intervals */
+        abr_update_congested(a, -50, 0.0f, 0, t);
+        t += TICK_MS;
+    }
+    assert(abr_current_state(a) == settled);
+    printf("\xE2\x9C\x93 abr: no headroom -> ceiling holds, no periodic re-probe\n");
+
+    abr_set_headroom(a, 1);                  /* capacity really did free up */
+    for (int i = 0; i < 200; i++) {
+        abr_update_congested(a, -50, 0.0f, 0, t);
+        t += TICK_MS;
+    }
+    assert(abr_current_state(a) == ABR_STATE_NL_96K);
+    printf("\xE2\x9C\x93 abr: headroom restored -> climbs back to best quality\n");
+    abr_ctrl_destroy(a);
+
+    /* --- abr_start_at: the start rung is also the initial ceiling ---------
+       `auto` starts at HQ-96k (NL-96k needs ~3 Mbps on real music — no RFCOMM
+       link carries that, so the optimistic start flooded the queue every
+       session). Strong RSSI alone must NOT jump the ladder above the start
+       rung; that has to be earned through the headroom-gated probe. */
+    a = abr_ctrl_create(NULL, NULL);
+    t = 0;
+    abr_start_at(a, ABR_STATE_HQ_96K, t);
+    assert(abr_current_state(a) == ABR_STATE_HQ_96K);
+    for (int i = 0; i < 20; i++) {   /* RSSI classifies NL-96k the whole time */
+        abr_update_congested(a, -50, 0.0f, 0, t); t += TICK_MS;
+    }
+    assert(abr_current_state(a) == ABR_STATE_HQ_96K);
+    /* Congestion still downgrades immediately from the start rung. */
+    abr_update_congested(a, -50, 0.0f, 1, t); t += TICK_MS;
+    assert(abr_current_state(a) == ABR_STATE_HQ_48K);
+    printf("\xE2\x9C\x93 abr: start-at holds the start rung against strong RSSI, "
+           "still downgrades on congestion\n");
+    abr_ctrl_destroy(a);
+
+    /* With real headroom the ceiling relaxes one rung per probe interval, so a
+       link that genuinely has spare capacity can still reach the NL rungs. */
+    a = abr_ctrl_create(NULL, NULL);
+    t = 0;
+    abr_start_at(a, ABR_STATE_HQ_96K, t);
+    abr_set_headroom(a, 1);
+    t += ABR_PROBE_INTERVAL_MS;
+    for (int i = 0; i < 10; i++) { abr_update_congested(a, -50, 0.0f, 0, t); t += TICK_MS; }
+    assert(abr_current_state(a) == ABR_STATE_NL_48K);
+    printf("\xE2\x9C\x93 abr: start-at + proven headroom climbs one rung per "
+           "probe interval\n");
+    abr_ctrl_destroy(a);
+
+    /* --- SMR recovery is fast while the queue is idle ---------------------
+       After a congestion cut the controller used to crawl back at 0.4 dB per
+       tick (~26 s from the floor to the ceiling) even with a bone-dry queue.
+       The idle fast tier must recover in well under half that. */
+    {
+        float smr = ABR_SMR_MIN_DB;
+        int ticks = 0;
+        while (smr < ABR_SMR_MAX_DB && ticks < 1000) {
+            smr = abr_smr_step(smr, 0, 0);   /* queue empty, nothing dropped */
+            ticks++;
+        }
+        int max_ticks = (int)((ABR_SMR_MAX_DB - ABR_SMR_MIN_DB)
+                              / ABR_SMR_UP_FAST_DB) + 1;
+        assert(ticks <= max_ticks);
+        printf("\xE2\x9C\x93 abr: idle-queue SMR recovery %g -> %g dB in %d ticks "
+               "(%.1f s at 250 ms)\n",
+               (double)ABR_SMR_MIN_DB, (double)ABR_SMR_MAX_DB,
+               ticks, ticks * 0.25);
+    }
+
+    /* --- HQ rate controller converges ------------------------------------
+       Simulate a link with a fixed capacity and let the AIMD loop find it. The
+       model: bitrate rises ~25 kbps per dB of SMR, anything over capacity
+       accumulates in the queue, anything under drains it. The loop must settle
+       without pinning the queue and without collapsing to the floor. */
+    const float kbps_at_min = 200.0f;        /* rate at ABR_SMR_MIN_DB          */
+    const float kbps_per_db = 25.0f;
+    for (int c = 0; c < 3; c++) {
+        const float capacity[3] = { 900.0f, 520.0f, 300.0f };
+        float smr = ABR_SMR_MAX_DB;
+        float queue = 0.0f;                  /* ms of audio backed up           */
+        int   drops = 0, settled_ticks = 0;
+
+        for (int i = 0; i < 400; i++) {
+            float kbps = kbps_at_min + (smr - ABR_SMR_MIN_DB) * kbps_per_db;
+            /* Over/under capacity translates directly into queue growth. */
+            queue += (kbps - capacity[c]) / capacity[c] * TICK_MS;
+            if (queue < 0.0f) queue = 0.0f;
+            drops = 0;
+            if (queue > 500.0f) { queue = 500.0f; drops = 1; }
+            smr = abr_smr_step(smr, (int)queue, drops);
+            if (i > 200 && queue < ABR_QUEUE_HIGH_MS) settled_ticks++;
+        }
+        /* Settled: the queue spends the back half of the run drained, and the
+           controller has not bottomed out unless the link genuinely demands it. */
+        assert(settled_ticks > 150);
+        assert(smr >= ABR_SMR_MIN_DB && smr <= ABR_SMR_MAX_DB);
+        float final_kbps = kbps_at_min + (smr - ABR_SMR_MIN_DB) * kbps_per_db;
+        assert(final_kbps <= capacity[c] * 1.15f);
+        printf("\xE2\x9C\x93 abr: rate control settles at SMR %4.1f dB "
+               "(~%.0f kbps) on a %.0f kbps link\n",
+               smr, final_kbps, capacity[c]);
+    }
+
     printf("\nAll ABR tests passed.\n");
     return 0;
 }

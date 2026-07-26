@@ -1,11 +1,18 @@
 # AetherCodec — Manual Testing Guide
 
 A short, step-by-step guide to build AetherCodec and manually verify each phase
-that is currently implemented (**Phase 0–6**).
+that is currently implemented (**Phase 0–8**).
 
 > **Legend**
 > - 🖥️ **A** = Laptop A (sender)   🎧 **B** = Laptop B (receiver)
 > - 💻 = runs on a single machine (no second laptop needed)
+
+> **Start here if audio is cracking.** Bluetooth Classic cannot carry hi-res
+> lossless: NL-96k needs **~3.2 Mbps** on real music and a measured RFCOMM link
+> sustained **~200 kbps**. Use the **TCP transport (§11)** — `--tcp` on both
+> daemons — which carries NL-96k bit-perfect with `lost=0`. Sections 3–9 below
+> remain the Bluetooth path and are still worth running to characterise the
+> link, but no codec setting makes Bluetooth close a 15x gap.
 
 ---
 
@@ -34,7 +41,7 @@ cd ~/aethercodec/build
 ctest --output-on-failure
 ```
 
-**Expect:** `100% tests passed, 0 tests failed out of 9`.
+**Expect:** `100% tests passed, 0 tests failed out of 10`.
 
 Run them individually to see the detail:
 
@@ -47,6 +54,7 @@ Run them individually to see the detail:
 ./tests/test_ring       # lock-free SPSC ring, incl. threaded producer/consumer
 ./tests/test_jitter     # jitter buffer: reorder, duplicate, loss detection
 ./tests/test_abr        # ABR ladder: classification + hysteresis timing
+./tests/test_abr_switch # mid-stream switches: sequence continuity + MDCT rate relatch
 ./tests/test_resample   # 2:1 decimate/interpolate for the 48 kHz states
 ```
 
@@ -83,6 +91,18 @@ design, so it reports SNR/bitrate instead (see §5).
 # 🖥️ A
 ./tools/rfcomm_bench client BB:BB:BB:BB:BB:BB
 ```
+
+Then repeat with `--l2cap` on **both** ends to bench the experimental L2CAP
+`SOCK_SEQPACKET` transport (no RFCOMM framing/credit flow control in the path):
+
+```bash
+# 🎧 B                                   # 🖥️ A
+./tools/rfcomm_bench server --l2cap      ./tools/rfcomm_bench client BB:BB:BB:BB:BB:BB --l2cap
+```
+
+If L2CAP measures meaningfully higher on your pair, run both daemons with
+`--l2cap` too (sender **and** receiver — the variants don't interoperate).
+The gain is hardware-dependent; RFCOMM stays the default.
 
 **Expect:** B prints a throughput line. **Record the number** — it sets the
 realistic bitrate ceiling for the codec.
@@ -163,14 +183,29 @@ cover it.
 
 | Signal    | SNR full | SNR audible | Bitrate   |
 |-----------|----------|-------------|-----------|
-| tonal     | ~27.5 dB | ~27.5 dB    | ~540 kbps |
-| broadband | ~13 dB   | ~27.6 dB    | ~1050 kbps |
+| tonal     | ~27.5 dB | ~27.5 dB    | ~180 kbps |
+| broadband | ~13 dB   | ~27.6 dB    | ~595 kbps |
+
+Plus an SMR sweep proving the rate knob works:
+
+| SMR | Bitrate | Audible SNR |
+|-----|---------|-------------|
+| 30 dB (default) | ~595 kbps | ~27.6 dB |
+| 24 dB | ~526 kbps | ~21.3 dB |
+| 18 dB | ~374 kbps | ~16.3 dB |
+| 12 dB (controller floor) | ~294 kbps | ~11.7 dB |
+| 6 dB (codec floor) | ~198 kbps | ~1.7 dB — noise, never used |
 
 How to read this:
 
 - **Bitrate is content-adaptive.** Sparse tonal material needs far fewer bits
-  than dense broadband material. Broadband (~1050 kbps) is the realistic worst
-  case and lands inside the PRD's **900–1,100 kbps** HQ target.
+  than dense broadband material; broadband is the realistic worst case. These
+  numbers are roughly half what they were before HQ gained its **band mask**:
+  Rice never codes a symbol in zero bits, so the ~63% of 96 kHz bins the ATH
+  correctly zeroes still cost a bit each, flooring HQ-96k near 500 kbps whatever
+  the quantiser did. Skipping dead bands costs 8 bytes/channel/frame and halves
+  the rate at *identical* SNR — which is why broadband now lands under the PRD's
+  900–1,100 kbps target rather than at the top of it.
 - **Two SNRs are reported on purpose.** At 96 kHz the spectrum runs to 48 kHz,
   but the absolute threshold of hearing correctly quantises everything above
   ~17.6 kHz to zero. That discarded ultrasonic content is what drags *full-band*
@@ -182,15 +217,30 @@ How to read this:
 
 ### 5.3 Tuning quality vs bitrate
 
-The single knob is `MDCT_SMR_DB` in `src/encoder/codec_mdct_enc.c`
-(signal-to-mask ratio, currently **30 dB**). Roughly **6 dB ≈ 1 bit** per
-significant coefficient:
+The single knob is the signal-to-mask ratio, **default 30 dB**, roughly
+**6 dB ≈ 1 bit** per significant coefficient. It is a runtime value
+(`mdct_set_smr_db`), not a compile-time constant:
 
-- **Lower** it (e.g. 24) → smaller packets, lower SNR.
-- **Raise** it (e.g. 36) → better SNR, higher bitrate.
+- **Lower** it → smaller packets, lower SNR.
+- **Raise** it → better SNR, higher bitrate (controller ceiling **54 dB**,
+  codec clamp 60 dB).
 
-Rebuild and re-run `test_codec_hq` to see the new operating point. The doc's
-suggested 12 dB gives only ~13 dB SNR at ~490 kbps — under half the HQ budget.
+**The sender drives it automatically.** A fixed quality means an uncontrolled
+bitrate — on a real link HQ-96k drifted from 440 to 860 kbps as the music got
+denser, overran the link and dropped ~20% of frames. `abr_smr_step()` closes an
+AIMD loop against send-queue depth: quality eases up while the queue drains
+(+1.2 dB/tick while the queue is empty, +0.4 dB near capacity), backs off in
+proportion to how far behind it gets. That is what makes fixed `--mode hq`
+smooth without needing `auto`. Watch it live in the sender's `smr=NNdB` field.
+`test_abr` proves it converges on 900 / 520 / 300 kbps links (settling at SMR
+41.5 / 26.4 / 15.9 dB).
+
+> The ceiling used to be 30 dB, which pinned HQ at ~480 kbps while the measured
+> link carried ~900 — half the link idle, and audibly "average" quality. With
+> the 54 dB ceiling the **queue**, not the constant, is what stops the climb on
+> any realistic link: expect `smr=` to settle wherever your link's real
+> capacity is (~40–50 dB on a healthy EDR link), and expect noticeably higher
+> `[stats] kbps` in HQ than before. SMR ≈ audible SNR above the 12 dB floor.
 
 ---
 
@@ -275,8 +325,41 @@ pw-play --target aether_codec_sink your_music.flac
 
 **Expect:** audio on B's headphones, and receiver stats showing
 `recv= played= lost= buffer=…ms underruns=`. Sustained playback should hold
-`lost=0` and `underruns=0`; rising underruns means the link cannot keep up
-(check §3.2 throughput) — that is what Phase 5's ABR will address.
+`lost=0` and `underruns` near 0 and flat. The sender's `[stats]` line also
+shows `rxloss=`/`rxbuf=` — the receiver's own loss measurement and buffer
+depth, reported back over the link every ~500 ms (`rxloss=` should agree with
+B's `lost=` rate; `rxbuf=-1ms` just means no report has arrived yet).
+
+> **Stutter?** The bitrate a mode needs may exceed what the link smoothly
+> carries. The sender decouples encode from send (a queue + send thread, bounded
+> at ~500 ms of *queued audio* so NL and HQ get the same slack) and the receiver
+> prebuffers ~600 ms — deliberately more than the sender's 500 ms hold, so a
+> Bluetooth burst the sender rides out by queuing the receiver rides out by
+> buffering (a smaller cushion underran on every stall, `underruns` climbing
+> while `lost=0`). So a mode that *fits* plays cleanly. If a **fixed** mode
+> still stutters, the link can't carry it — use `--mode auto`, which steps down
+> on **send-queue backpressure** (see §7), not just RSSI. Watch the sender's
+> `queue=…ms` / `dropped=` fields: a queue that stays high or a rising `dropped`
+> count means that mode is over budget, and the sender says so once in plain
+> English.
+>
+> **Read `link=` , not `rfcomm_bench`.** The sender now reports the throughput
+> the air interface is *actually* sustaining. On the reference pair a short
+> `rfcomm_bench` burst read 1,003 kbps while a sustained stream carried only
+> ~525 kbps — the bench is a best case, and 2.4 GHz Wi-Fi coexistence on either
+> laptop roughly halves it. Size your expectations off `link=`.
+>
+> **NL-96k on a ~1 Mbps link will never be smooth.** Measured on real music it
+> needs **~3,100 kbps**, not the PRD's ~1,400: LPC gets about 1.5× on 24-bit
+> material, because the low bits of a 24-bit master are noise and Rice coding
+> cannot compress noise. NL is lossless, so there is no quality to trade away —
+> the bitrate is whatever the music needs. HQ has a rate controller and will fit
+> the link; NL cannot. That is the one honest limit here.
+>
+> Note also that the receiver's `lost=` counter is **not** on-air loss — RFCOMM
+> is a reliable stream. It counts gaps in the sequence, which in practice means
+> packets the *sender* dropped from its own send queue. Sender `dropped` and
+> receiver `lost` tracking each other is the signature.
 
 ### 6.4 Known environment limitation
 
@@ -389,11 +472,21 @@ Without `CAP_NET_RAW` the daemon prints a one-time warning and **holds** the
 current quality rather than assuming the worst — an unreadable RSSI is not
 evidence of a bad link.
 
-> **Not implemented:** packet-loss feedback. The ladder's loss thresholds are
-> honoured by `abr_classify`, but the receiver's `CTRL_STATS_REPLY` back-channel
-> does not exist yet, so the live engine drives on RSSI alone (loss is passed as
-> 0). Loss-driven switching is covered by `test_abr` but cannot yet happen on a
-> real link.
+> **Backpressure (the important one for a strong but slow link).** RSSI can be
+> excellent while the link still cannot carry NL-96k. The engine therefore also
+> watches the sender's **send-queue depth**: when it backs up, `auto` drops a
+> rung immediately (even at −16 dBm) and won't climb back into that mode for
+> ~20 s, so it settles on the best mode the link can actually sustain. This is
+> why `auto` can sound clean where fixed NL-96k stutters. Covered by `test_abr`
+> (`congestion steps down despite strong RSSI`).
+>
+> **Receiver loss feedback (`CTRL_STATS_REPLY`) is now implemented.** The
+> receiver reports its measured sequence-gap loss, buffer depth and underruns
+> back up the same socket every ~500 ms; the sender shows it as
+> `rxloss=`/`rxbuf=` in `[stats]` and feeds it to `abr_classify`'s 1/3/8%
+> loss thresholds. A report older than 2 s counts as "no data" (loss 0), so a
+> stalled reverse path can never wedge ABR. Congestion from the send queue
+> still applies on top.
 
 ---
 
@@ -513,7 +606,7 @@ On **each** laptop:
 
 ```bash
 # same checkout, clean build, all unit tests green
-cd ~/aethercodec/build && ctest        # expect 9/9
+cd ~/aethercodec/build && ctest        # expect 10/10
 
 # PipeWire session is up
 pgrep -a pipewire                      # must show a running server
@@ -526,7 +619,10 @@ Write down both addresses. Below, `BB:BB:BB:BB:BB:BB` is **B's** address.
 
 > Both laptops must run the **same build** — the wire format has no version
 > negotiation, so a stale binary on one side will mis-decode. Rebuild both from
-> the same commit if in doubt.
+> the same commit if in doubt. **The 2026-07-25 link-efficiency changes
+> (mid/side stereo, NL wasted bits, HQ 4-hop packet batching, stats
+> back-channel) changed the payload format** — a pre-change binary on either
+> side decodes garbage. Rebuild both.
 
 ### 9.1 Pair A and B (once)
 
@@ -631,21 +727,37 @@ sudo setcap cap_net_raw+ep ./src/aether_sender
 pw-play --target aether_codec_sink your_music.flac
 ```
 
+> **`auto` on a real link starts at HQ-96k, not NL-96k.** Measured NL-96k needs
+> ~3 Mbps on real music — no RFCOMM link carries that — so the old "optimistic"
+> start flooded the send queue and glitched the first seconds of *every*
+> session (that was the `dropped=71` / `underruns=41984` burst in run three).
+> The start rung is also the initial ceiling: NL rungs are only probed after
+> the link has *proven* spare capacity (queue drained AND quality already
+> pinned at the 54 dB max) — roughly one rung per 20 s, at best. On most links
+> HQ-96k never reaches the 54 dB ceiling, so `auto` simply stays there at
+> whatever quality the link affords; that is the intended steady state.
+> Loopback / `--abr-demo` keep the NL-96k start so the sweep shows the ladder.
+
 Now **physically walk A away from B** and back, watching both consoles:
 
-- 🖥️ A logs `[abr] NL-96kHz -> NL-48kHz (RSSI=… dBm)` as you move away, stepping
+- 🖥️ A logs `[abr] HQ-96kHz -> HQ-48kHz (RSSI=… dBm)` as you move away, stepping
   down the ladder; walking back **upgrades**, and each upgrade waits ~3 s.
 - 🎧 B logs `[receiver] stream rate -> 48000 Hz, mode=…` following the switches,
-  and audio stays continuous (no dropouts) across them.
+  and audio stays continuous (no dropouts) across them. ABR switches now flush
+  the sender's queued backlog, so expect a small `dropped=` uptick (mirrored in
+  the receiver's `lost=`) at each downgrade — a short concealed gap, not the
+  old multi-second cascade.
 - Cross-check the reading any time with `hcitool rssi BB:BB:BB:BB:BB:BB` on A.
 
-**Expect:** NL-96k held at 0–1 m; graceful step-down by ~5 m+; audio never cuts
-out, only changes quality. If A prints `cannot read RSSI`, the `setcap` didn't
-take (or you rebuilt the binary — re-run it) and ABR holds its current state.
+**Expect:** HQ-96k with `smr=` in the 40s at 0–1 m; graceful step-down by ~5 m+;
+audio never cuts out, only changes quality. If A prints `cannot read RSSI`, the
+`setcap` didn't take (or you rebuilt the binary — re-run it) and ABR holds its
+current state.
 
-> The live engine drives on **RSSI only** — packet-loss feedback
-> (`CTRL_STATS_REPLY`) isn't implemented yet, so a link that's strong but lossy
-> won't downgrade on its own. See §7.4.
+> The live engine drives on **RSSI + receiver-reported loss + send-queue
+> backpressure**: the receiver's `CTRL_STATS_REPLY` (watch `rxloss=` in the
+> sender's `[stats]`) now closes the loss loop, so a strong-but-lossy link
+> downgrades on its own. See §7.4.
 
 ### 9.5 Sustained run + record results
 
@@ -695,13 +807,125 @@ into the comparison table in `docs/AetherCodec_IMPLEMENTATION.md` §6.4.
 | Streaming works but audio comes out of **A's** speakers | forgot `--target aether_codec_sink` on `pw-play` | Our sink has priority −1, so A's real output stays default; always target the sink |
 | B decodes garbage / loud noise | mismatched builds on A and B | Rebuild both from the same commit (no wire-format versioning) |
 | Two-machine `garbled after a while`, `underruns` climbing | link below the codec's bitrate | Check §9.2 throughput; use `--mode auto` or `hq` |
+| Stutter with **`lost=0` but huge `underruns`** (≫ playtime) | playback over-drained the ring (fixed) | Rebuild — playback pins one quantum. `underruns` far exceeding total samples played meant the buffer was pulled several× realtime |
+| Periodic breaks; `underruns` climbs in chunks while **`lost=0` AND sender `dropped=0`** (fixed) | receiver cushion smaller than the sender's queue hold | Rebuild — the receiver prebuffer is now 600 ms (> the sender's 500 ms hold). The sender delays a packet up to 500 ms during a Bluetooth stall before dropping; a 250 ms cushion underran on every stall longer than itself even though every packet arrived |
+| Rare click every few minutes, otherwise smooth | A/B sample-clock drift | Expected for now — no async resampler; the prebuffer re-primes on a full drain |
+| Receiver `played` frozen while `recv` climbs, `lost` flat | sender's packet sequence restarted (fixed) | Rebuild both sides. ABR switches used to recreate the encoder, resetting `sequence` to 0; the jitter buffer then discarded everything as "already played". It now re-anchors on a large discontinuity too |
+| `auto` sounds fine in NL but HQ is noise/dull after a switch | MDCT rate tables latched (fixed) | Rebuild both sides — `mdct_init()` now rebuilds the Bark/ATH tables when the rate changes. Mismatched tables between A and B decode as noise |
+| Receiver `lost` tracks the sender's `dropped` exactly | not on-air loss at all | RFCOMM is reliable; every "lost" packet was dropped from the sender's send queue. Read the *sender's* `dropped`, and treat it as "this mode is over the link's budget" |
+| `[stats]` shows an absurd kbps right after a mode switch (fixed) | bitrate mixed old bytes with new frame duration | Rebuild. The counter now resets per operating point and divides by wall-clock seconds |
+| Steady `overflow=` on the receiver | ring filling faster than playback drains | Sender clock running ahead, or the timebase is wrong. With current builds this should stay 0 |
 
 ---
 
-## 11. Quick checklist
+## 11. Phase 8 — TCP transport over Wi-Fi (`--tcp`)
+
+**This is the section to use if audio cracks in every mode.** Bluetooth Classic
+cannot carry hi-res lossless — see the note at the top of this document. TCP
+carries the same AetherPacket stream, byte for byte, over Wi-Fi instead.
+
+`--tcp` is opt-in and mutually exclusive with `--l2cap`; RFCOMM stays the
+default. **Both ends must use it.** Nothing above the transport changes: same
+wire format, same codec, same jitter buffer, and the `CTRL_STATS_REPLY` reverse
+channel works exactly as on Bluetooth.
+
+### 11.1 Single-machine TCP loopback (💻 — no Bluetooth, no second laptop)
+
+The whole path over `127.0.0.1`, which is the fastest way to prove the codec
+runs smooth once the link isn't the bottleneck:
+
+```bash
+# terminal 1 — receiver listens on 0.0.0.0:7331
+./src/aether_receiver --tcp --verbose
+
+# terminal 2 — sender
+./src/aether_sender --tcp --target 127.0.0.1 --mode nl --verbose
+
+# terminal 3 — play a hi-res file into the sink
+sox -n -r 96000 -b 24 -c 2 /tmp/tone.wav synth 30 sine 440 sine 660 vol 0.4
+pw-play --target aether_codec_sink /tmp/tone.wav
+```
+
+**Expect** (measured on the reference machine):
+
+| Mode | Sender | Receiver |
+|---|---|---|
+| `--mode nl` | `link=3250 kbps  queue=21ms  dropped=0` | `lost=0 overflow=0 underruns=0` |
+| `--mode hq` | `smr=54dB` (the controller's **max**), `dropped=0` | `lost=0 underruns=0` |
+| `--mode auto` | `[abr] holding NL-96kHz (loss=0.0%)` from the first poll | `recv == played` |
+
+Three things to read off that:
+
+- **`link=` is the number that matters.** ~3,250 kbps in NL-96k is what
+  near-lossless 24/96 genuinely costs on real content. Bluetooth sustained
+  ~200 kbps — that gap *is* the cracking.
+- **`queue=21ms` (one frame) and `dropped=0`** mean the send queue never backs
+  up. On Bluetooth it pinned at the 500 ms bound and shed frames.
+- **HQ pins at `smr=54dB`** — maximum quality — instead of being driven toward
+  the 12 dB floor. SMR ≈ audible SNR, so this is the transparent end of the
+  range.
+
+> The `[stats] kbps` field is a cumulative average over the operating point, so
+> it starts low and climbs while silence is still in the average. `link=` is
+> instantaneous — trust it.
+
+### 11.2 Two laptops over Wi-Fi (A + B)
+
+Prefer **5 GHz** — 2.4 GHz shares the band with Bluetooth and is exactly the
+coexistence problem being escaped. Both laptops on the same network/subnet.
+
+```bash
+# 🎧 B — note its IP first
+ip -4 addr show | grep inet          # e.g. 192.168.1.42
+./src/aether_receiver --tcp --verbose
+
+# 🖥️ A
+./src/aether_sender --tcp --target 192.168.1.42 --mode nl --verbose
+pw-play --target aether_codec_sink your_music.flac
+```
+
+**Gate:** `lost=0 underruns=0` over 60 s of real music in **NL-96k** — the
+bit-perfect mode, which Bluetooth could never sustain. Then repeat with
+`--mode hq` (expect `smr=` at or near 54) and `--mode auto` (should sit at
+NL-96kHz and never step down on a clean LAN).
+
+Non-default port, if 7331 is taken: `--port 9000` on B, `--target IP:9000` on A.
+
+### 11.3 Throughput comparison
+
+```bash
+# 🎧 B                                # 🖥️ A
+./tools/rfcomm_bench server --tcp     ./tools/rfcomm_bench client <B-IP> --tcp
+```
+
+Compare against the RFCOMM/L2CAP numbers from §3.2. TCP should read multi-Mbps
+where Bluetooth reads hundreds of kbps.
+
+### 11.4 ABR on TCP is loss-driven, not RSSI-driven
+
+There is no HCI RSSI for an IP peer, so `--tcp` doesn't poll it — `[abr]` lines
+print `loss=…%` instead of `RSSI=…`. The ladder is driven by the receiver's
+reported loss plus send-queue backpressure, both of which work fine over TCP.
+`auto` also starts at NL-96k with **no** congestion ceiling (the Bluetooth path
+starts at HQ-96k and earns the NL rungs slowly, which on Wi-Fi would just hold
+quality down for ~20 s per rung for no reason).
+
+### 11.5 Known limits
+
+- **Occasional clicks on a long session are clock drift, not transport.** A and
+  B run independent 96 kHz clocks with no async resampler between them. Fix
+  belongs on the playback side; unrelated to `--tcp`.
+- **TCP retransmits add latency exactly when the network is worst.** A UDP +
+  jitter-buffer variant is the more correct real-time design and is the natural
+  follow-up; TCP came first because it reuses the framing loop verbatim.
+- **No discovery** — the receiver's IP is typed by hand (no mDNS/Wi-Fi Direct).
+
+---
+
+## 12. Quick checklist
 
 - [ ] `make` — clean build, no warnings
-- [ ] `ctest` — 9/9 pass
+- [ ] `ctest` — 10/10 pass
 - [ ] `rfcomm_ping` — 10 pings received on B
 - [ ] `rfcomm_bench` — throughput recorded: ______ kbps
 - [ ] `raw_stream` — audible on B
@@ -713,9 +937,10 @@ into the comparison table in `docs/AetherCodec_IMPLEMENTATION.md` §6.4.
 - [ ] `--loopback` — `frames` counter advances while playing audio in
 - [ ] Two-machine: audio on B's headphones, `lost=0 underruns=0`
 - [ ] `test_abr` — downgrade ≤ 1 s, upgrade held 3 s, no oscillation
+- [ ] `test_abr_switch` — sequence continuous across the ladder; HQ SNR > 15 dB after a 96k→48k switch
 - [ ] `test_resample` — 1 kHz ratio ≈ 1.00, 35 kHz rejected < −40 dB
 - [ ] `--abr-demo` — transitions logged and `mode=`/`rate=` follow, no errors
-- [ ] Real range test: NL-96k held at 0–1 m, degrades gracefully at 5 m+
+- [ ] Real range test: HQ-96k (smr ~40s) held at 0–1 m, degrades gracefully at 5 m+
 - [ ] `aether_encode`/`aether_decode` NL round-trip — bit-identical raw PCM
 - [ ] `aether_encode`/`aether_decode` HQ round-trip — `compare_spectra.py --shift 512` audible SNR ~27 dB
 - [ ] Real range/listening tests (§8.3): latency, THD+N, MUSHRA, LDAC comparison — pending real hardware

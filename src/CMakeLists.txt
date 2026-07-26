@@ -12,6 +12,7 @@
 add_library(aether_transport STATIC
     transport/aether_packet.c
     transport/transport_rfcomm.c
+    transport/transport_tcp.c
 )
 target_include_directories(aether_transport PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # libbluetooth (from libbluetooth-dev) provides ba2str/str2ba and the RFCOMM API.

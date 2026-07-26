@@ -17,14 +17,39 @@
 
 /* Signal-to-mask ratio — the operating point of the whole HQ mode.
    The masking threshold is placed SMR dB below the spread masker energy, so
-   this constant is effectively the rate/quality control: each 6 dB costs about
-   1 bit per significant coefficient.
+   this is the rate/quality control: each 6 dB costs about 1 bit per significant
+   coefficient.
    The HLD suggests ~12 dB, but that yields only ~13 dB SNR at ~490 kbps —
-   barely half the PRD's 900-1,100 kbps HQ budget, i.e. it discards quality the
-   Bluetooth link can comfortably carry. 30 dB puts the measured bitrate inside
-   the target band (see tests/test_codec_hq.c). */
-#define MDCT_SMR_DB     30.0f
-#define MDCT_SMR_LINEAR 1.0e-3f    /* 10^(-30/10) */
+   barely half the PRD's 900-1,100 kbps HQ budget. 30 dB is the default and puts
+   the measured bitrate inside the target band (see tests/test_codec_hq.c).
+
+   It is a *runtime* value, not a compile-time constant, because a fixed SMR
+   means a fixed quality and therefore an uncontrolled bitrate: on a link that
+   cannot carry what the content happens to need, the sender's queue backs up
+   and frames get dropped, which is far more audible than the coarser
+   quantisation that would have avoided it. The sender closes the loop on this
+   (see aether_sender.c). Process-global like the rest of this module's tables.
+
+   The codec-level ceiling is 60 dB (~10 bits per significant coefficient);
+   the operational ceiling lives in the rate controller (ABR_SMR_MAX_DB). It
+   used to be 30 dB here too, which silently capped HQ at ~480 kbps while the
+   measured link carried ~900 — half the link idle and the quality complaint to
+   match. Rice adapts its parameter per frame, so finer steps just cost bits. */
+#define MDCT_SMR_DEFAULT_DB 30.0f
+#define MDCT_SMR_MIN_DB      6.0f
+#define MDCT_SMR_MAX_DB     60.0f
+
+static float smr_db     = MDCT_SMR_DEFAULT_DB;
+static float smr_linear = 1.0e-3f;         /* 10^(-30/10) */
+
+void mdct_set_smr_db(float db) {
+    if (db < MDCT_SMR_MIN_DB) db = MDCT_SMR_MIN_DB;
+    if (db > MDCT_SMR_MAX_DB) db = MDCT_SMR_MAX_DB;
+    smr_db     = db;
+    smr_linear = powf(10.0f, -db / 10.0f);
+}
+
+float mdct_get_smr_db(void) { return smr_db; }
 
 static float kbd_window[MDCT_SIZE];
 static int   bark_of_bin[MDCT_COEFFS];
@@ -132,19 +157,41 @@ static void init_ath_table(int sample_rate) {
     }
 }
 
-void mdct_init(int sample_rate) {
-    if (mdct_ready) return;
-    init_kbd_window();
-    init_bark_table(sample_rate);
-    init_ath_table(sample_rate);
+/* Rebuilds the rate-dependent tables whenever the sample rate changes.
 
-    dct_in  = (float*)fftwf_malloc(sizeof(float) * MDCT_M);
-    dct_out = (float*)fftwf_malloc(sizeof(float) * MDCT_M);
-    /* REDFT11 == DCT-IV. FFTW's REDFT11 carries an extra factor of 2, i.e.
-       it computes 2*D where D is the orthogonal-up-to-scale DCT-IV matrix. */
-    dct_plan = fftwf_plan_r2r_1d(MDCT_M, dct_in, dct_out,
-                                 FFTW_REDFT11, FFTW_ESTIMATE);
-    mdct_ready = 1;
+   This used to bail out on `if (mdct_ready) return;` — i.e. the Bark map and
+   ATH latched to whichever rate happened to be requested first and were never
+   rebuilt. Under ABR that is wrong on both sides and in two different ways:
+
+     - Encoder: created at 96 kHz, so after a switch to HQ-48k it kept the
+       96 kHz ATH. The threshold that should zero content above ~17.6 kHz then
+       lands on bin indices that are 48 kHz bins, killing everything above
+       ~8.8 kHz — an audible low-pass on every 48 kHz HQ state.
+     - Encoder vs decoder: the decoder calls mdct_init() from the first HQ
+       packet it sees. If the sender started in NL-96k and the first HQ packet
+       to arrive was HQ-48k, the two ends latched *different* band tables, so
+       band_start[] disagreed and dequantisation applied the wrong step to the
+       wrong bins — decoded noise, not a subtle artifact.
+
+   The window and the FFTW plan are rate-independent, so those stay one-shot. */
+void mdct_init(int sample_rate) {
+    static int mdct_rate = 0;
+
+    if (!mdct_ready) {
+        init_kbd_window();
+        dct_in  = (float*)fftwf_malloc(sizeof(float) * MDCT_M);
+        dct_out = (float*)fftwf_malloc(sizeof(float) * MDCT_M);
+        /* REDFT11 == DCT-IV. FFTW's REDFT11 carries an extra factor of 2, i.e.
+           it computes 2*D where D is the orthogonal-up-to-scale DCT-IV matrix. */
+        dct_plan = fftwf_plan_r2r_1d(MDCT_M, dct_in, dct_out,
+                                     FFTW_REDFT11, FFTW_ESTIMATE);
+        mdct_ready = 1;
+    }
+    if (sample_rate != mdct_rate) {
+        init_bark_table(sample_rate);
+        init_ath_table(sample_rate);
+        mdct_rate = sample_rate;
+    }
 }
 
 const float* mdct_window(void) { return kbd_window; }
@@ -197,7 +244,7 @@ void mdct_masking_threshold(const float *coeffs, float *mask_out) {
                                     : powf(10.0f, ( 6.0f * dz) / 10.0f);
             spread += band_energy[i] * sf;
         }
-        mask_out[j] = spread * MDCT_SMR_LINEAR;
+        mask_out[j] = spread * smr_linear;
         if (mask_out[j] < ath_energy[j]) mask_out[j] = ath_energy[j];
     }
 }

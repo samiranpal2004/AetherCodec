@@ -33,6 +33,30 @@ int main(void) {
     r = aether_packet_unpack(buf, n, &unpacked);
     assert(r == -3);  // payload CRC should fail
 
-    printf("\xE2\x9C\x93 Packet pack/unpack/CRC: PASS\n");
+    /* CTRL_STATS_REPLY round-trip: the receiver->sender back-channel rides the
+       same pack/unpack path, so prove the struct survives it byte-for-byte. */
+    AetherPacket ctrl = {0};
+    ctrl.hdr.magic        = AETHER_MAGIC;
+    ctrl.hdr.sequence     = 7;
+    ctrl.hdr.timestamp_us = (uint32_t)aether_timestamp_us();
+    ctrl.hdr.mode         = AETHER_MODE_CTRL;
+    AetherStatsReply sr = {
+        .type = CTRL_STATS_REPLY, .loss_x10 = 123,   /* 12.3 % */
+        .buffer_ms = 250, .underruns = 4242, .recv_total = 99999,
+    };
+    memcpy(ctrl.payload, &sr, sizeof(sr));
+    ctrl.hdr.payload_size = (uint16_t)sizeof(sr);
+
+    n = aether_packet_pack(&ctrl, buf, sizeof(buf));
+    assert(n > 0);
+    assert(aether_packet_unpack(buf, n, &unpacked) == 0);
+    assert(unpacked.hdr.mode == AETHER_MODE_CTRL);
+    AetherStatsReply back;
+    memcpy(&back, unpacked.payload, sizeof(back));
+    assert(back.type == CTRL_STATS_REPLY);
+    assert(back.loss_x10 == 123 && back.buffer_ms == 250);
+    assert(back.underruns == 4242 && back.recv_total == 99999);
+
+    printf("\xE2\x9C\x93 Packet pack/unpack/CRC + CTRL_STATS_REPLY: PASS\n");
     return 0;
 }

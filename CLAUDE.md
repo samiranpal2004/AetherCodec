@@ -57,8 +57,35 @@ Two static libs today: `aether_transport` (packet+RFCOMM, links `bluetooth`) and
 `aether_codec` (LPC+Rice+encoder/decoder, links `aether_transport` + `m`). New
 sources get added to the matching `src/CMakeLists.txt` target as each phase lands.
 
-**NL payload format** (self-describing, not fixed-size): `[frame_samples:u16]`
-then per channel `[order:u8][rice_k:u8][coeffs:order·i32][warmup:order·i32][rice_len:u16][rice_bytes]`.
+**NL payload format** (self-describing, not fixed-size): `[frame_samples:u16][flags:u8]`
+(flags bit0 = mid/side: `m=(l+r)>>1, s=l−r`, parity of `s` restores the lost bit)
+then per coded channel `[order:u8][rice_k:u8][wasted:u8][coeffs:order·i32][warmup:order·i32][rice_len:u16][rice_bytes]`
+— `wasted` = shared low zero bits shifted out pre-LPC, restored post-synthesis.
+
+**HQ payload format**: `[frame_samples:u16]` (total; 1–4 hops, multiple of
+`MDCT_HOP` — daemons batch `AETHER_HQ_HOPS_PER_PKT=4` to amortise the 24-byte
+header) then per hop `[flags:u8]` (bit0 = mid/side, applied to MDCT
+*coefficients* so the decoder's OLA history stays in L/R space) then per coded
+channel `[band_mask:u64][sf_rice_k:u8][sf_len:u16][sf_bytes][cf_rice_k:u8][cf_len:u16][cf_bytes]`
+— scalefactors and coefficients cover only the bands set in the mask.
+
+**Transport**: RFCOMM default; `--l2cap` on both daemons + `rfcomm_bench`
+selects L2CAP `SOCK_SEQPACKET` (PSM 0x1001, one packet per SDU) — experimental,
+benchmark per hardware pair. **`--tcp` streams over Wi-Fi instead** (port 7331,
+`--target IP[:PORT]`, receiver `--port N`): Bluetooth Classic cannot carry
+hi-res lossless — measured NL-96k needs ~3.2 Mbps against a ~200 kbps RFCOMM
+link — so TCP is what actually makes NL/HQ smooth. Same wire bytes and same
+framing loop as RFCOMM (`seqpacket=0`); only the constructors differ, all three
+share `rfcomm_send_packet`/`rfcomm_recv_packet` and the handle in the private
+`src/transport/transport_internal.h`. `--tcp` and `--l2cap` are mutually
+exclusive. On `--tcp` the sender **must not** poll RSSI (no HCI link) and must
+**skip `abr_start_at()`** — that call makes the start rung a ceiling relaxing
+one rung per 20 s, which would pin `auto` low on a link that carries NL-96k
+fine. **Receiver → sender back-channel**: the receiver
+sends `CTRL_STATS_REPLY` (`AetherStatsReply`: loss, buffer, underruns) every
+~500 ms; the sender's reader thread must drain the socket in *every* mode (an
+unread reverse path eventually blocks the receiver), and ABR gets real loss for
+its 1/3/8% thresholds (stale > 2 s ⇒ treated as 0).
 
 ## Intentional divergences from the spec docs
 
@@ -80,10 +107,23 @@ don't "fix" them back to match the prose:
 - Bark bands normalise by the Bark value **at Nyquist**, not a fixed 24 (at 96kHz
   a fixed 24 dumps ~2/3 of the spectrum into the last band); ATH dB is clamped
   before `powf` (the raw formula hits ~5300 dB at 48kHz and overflows).
-- `MDCT_SMR_DB = 30`, not 12 — the rate/quality knob. 12 dB yields ~13 dB SNR at
-  ~490 kbps, under half the 900–1,100 kbps HQ budget.
+- SMR defaults to **30 dB**, not the doc's 12 — the rate/quality knob (~6 dB per
+  bit per significant coefficient). It is a *runtime* value (`mdct_set_smr_db`),
+  not a constant: a fixed quality means an uncontrolled bitrate, and the sender
+  closes an AIMD loop on it (`abr_smr_step`) so HQ fits whatever the link
+  actually carries. Dropped frames are far more audible than coarse quantisation.
+  The controller's ceiling is **54 dB** (codec clamp 60) — it was 30, which
+  pinned HQ at ~480 kbps on a measured ~900 kbps link; with the higher ceiling
+  the queue, not the constant, stops the climb, so spare link capacity becomes
+  quality. The increase is two-tier (+1.2 dB/tick while the queue is idle,
+  +0.4 near capacity) so recovery from a congestion cut doesn't take ~26 s.
 - HQ entropy stage is **Rice, not Huffman** — the HLD's "fixed tables v1.0" are
   never specified anywhere, so untrained tables would be arbitrary.
+- **HQ payload carries a 64-bit band mask** (not in the HLD): Rice never codes a
+  symbol in zero bits, so the ~63% of 96 kHz bins that the ATH correctly zeroes
+  still cost a bit each. That floored HQ-96k near 500 kbps whatever the quantiser
+  did. Skipping dead bands costs 8 bytes/channel/frame and roughly halves the
+  rate at identical SNR.
 
 - **The virtual sink lives on the SENDER**, not the receiver (Step 4.1 says B,
   Step 4.4 contradicts it with A; only A works for the stated goal). Receiver is
@@ -101,6 +141,43 @@ don't "fix" them back to match the prose:
 - Mode/rate switches need no control packet: every header carries `mode` +
   `sample_rate` and the decoder flushes on change (survives packet loss, unlike
   a one-shot `CTRL_CODEC_CHANGE`).
+- **Sender decouples encode from send** (bounded packet queue + send thread):
+  `rfcomm_send_packet` blocks, and blocking the encode loop on big NL frames
+  drops captured audio and makes delivery bursty (stutter). Don't reintroduce a
+  direct send from the encode loop. The queue is bounded by **queued audio time**
+  (`SENDQ_MAX_MS`), never by slot count — a 2048-sample NL frame and a
+  512-sample HQ frame are 4x apart in duration, so counting slots silently gives
+  HQ a quarter of the slack.
+- **Don't hand-chunk sends at `AETHER_RFCOMM_MTU`.** BlueZ's
+  `rfcomm_sock_sendmsg` already fragments at the negotiated DLC MTU; pre-splitting
+  only forces extra RFCOMM frames. One `send()` per packet, looping only on short
+  writes.
+- **ABR also reacts to send-queue backpressure**, not just RSSI (`abr_update_congested`):
+  a strong link can still be unable to carry NL-96k. Congestion drops a rung
+  immediately and holds a ceiling for `ABR_PROBE_INTERVAL_MS` to avoid oscillation.
+- **`auto` on a real link starts at HQ-96k** (`abr_start_at`), not the HLD's
+  "optimistic" NL-96k: measured NL-96k is ~3 Mbps on real music, which no RFCOMM
+  link carries, so the optimistic start flooded the queue and cascaded to
+  HQ-48k/SMR-12 in the first second of every session. The start rung is also the
+  initial ceiling — NL must be earned via the headroom-gated probe. Loopback and
+  `--abr-demo` keep the NL-96k start (no real link; the demo sweeps the ladder).
+- **ABR switches flush the send queue** — the old mode's backlog is already
+  ~500 ms late and, left to drain, reads as the *new* mode being congested too
+  (that's the cascade above). Flushed packets are counted separately from
+  overflow drops: a flush must never feed the congestion or SMR-cut signals, or
+  each switch would trigger the next. The stats `dropped=` prints the sum so the
+  receiver's `lost` still matches.
+- **Receiver playback: fill one quantum, never `maxsize`.** PipeWire sizes
+  `maxsize` for its max quantum; filling it over-drains the ring several-fold
+  (huge `underruns` with `lost=0`). Pin the buffer via `SPA_PARAM_Buffers` +
+  `NODE_LATENCY`; `pw_buffer.requested` is absent before 0.3.49.
+- **Receiver prebuffer (`PLAY_PREBUFFER_MS`) must exceed the sender's queue hold
+  (`SENDQ_MAX_MS`).** The sender delays a packet up to `SENDQ_MAX_MS` (500 ms)
+  during a Bluetooth stall before dropping; if the receiver cushion is smaller,
+  it underruns on every such stall *even with no packet lost* — `underruns`
+  climbing in chunks while `lost=0 dropped=0` is the signature. Cushion is
+  600 ms (> 500 ms) so a burst the sender rides out by queuing, the receiver
+  rides out by buffering. Trades latency for smoothness — right for music.
 - NL-48K is lossless only *relative to the decimated signal*; 96→48 itself is
   lossy. Don't claim end-to-end bit-exactness for the 48k states.
 

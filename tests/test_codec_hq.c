@@ -71,8 +71,10 @@ static void make_signal(int kind) {
     }
 }
 
-static void run_case(int kind, const char *label,
-                     double *snr_aud_out, double *kbps_out) {
+/* batch = MDCT hops per packet (1 = classic one-hop packets; the daemons use
+   4 to amortise the per-packet header, see AETHER_HQ_HOPS_PER_PKT). */
+static void run_case_b(int kind, int batch, const char *label,
+                       double *snr_aud_out, double *kbps_out) {
     make_signal(kind);
     memset(pcm_out, 0, sizeof(pcm_out));
 
@@ -82,11 +84,12 @@ static void run_case(int kind, const char *label,
 
     static uint8_t wire[AETHER_HEADER_SIZE + AETHER_MAX_PAYLOAD + 4];
     long total_payload = 0;
+    int  npackets = NFRAMES / batch;
 
-    for (int f = 0; f < NFRAMES; f++) {
+    for (int f = 0; f < npackets; f++) {
         AetherPacket pkt;
-        int r = aether_encoder_encode(enc, pcm_in + f * MDCT_HOP * CH,
-                                      MDCT_HOP, &pkt);
+        int r = aether_encoder_encode(enc, pcm_in + f * MDCT_HOP * batch * CH,
+                                      MDCT_HOP * batch, &pkt);
         assert(r == 0);
         assert(pkt.hdr.mode == AETHER_MODE_HQ);
         total_payload += pkt.hdr.payload_size;
@@ -96,10 +99,12 @@ static void run_case(int kind, const char *label,
         AetherPacket rx;
         assert(aether_packet_unpack(wire, wlen, &rx) == 0);
 
-        int got = aether_decoder_decode(dec, &rx, pcm_out + f * MDCT_HOP * CH,
-                                        MDCT_HOP * CH);
-        assert(got == MDCT_HOP * CH);
+        int got = aether_decoder_decode(dec, &rx,
+                                        pcm_out + f * MDCT_HOP * batch * CH,
+                                        MDCT_HOP * batch * CH);
+        assert(got == MDCT_HOP * batch * CH);
     }
+    int NFRAMES_used = npackets;   /* packets, for header accounting below */
 
     /* Overlap-add delays output by exactly one hop; skip the priming frame. */
     const int lag  = MDCT_HOP;
@@ -136,12 +141,13 @@ static void run_case(int kind, const char *label,
     double snr_aud  = 10.0 * log10(sig_a / (err_a + 1e-12));
 
     double secs     = (double)NSAMP / SR;
-    double kbps     = (total_payload + (double)NFRAMES * (AETHER_HEADER_SIZE + 4))
+    double kbps     = (total_payload + (double)NFRAMES_used * (AETHER_HEADER_SIZE + 4))
                       * 8.0 / 1000.0 / secs;
     double raw_kbps = (double)SR * CH * 24 / 1000.0;
 
-    printf("  %-10s SNR full %5.1f dB | SNR audible %5.1f dB | peak err %8.0f | %6.0f kbps (%.1fx)\n",
-           label, snr_full, snr_aud, peak_err, kbps, raw_kbps / kbps);
+    if (label)   /* the SMR sweep below prints its own one-line summary */
+        printf("  %-10s SNR full %5.1f dB | SNR audible %5.1f dB | peak err %8.0f | %6.0f kbps (%.1fx)\n",
+               label, snr_full, snr_aud, peak_err, kbps, raw_kbps / kbps);
 
     assert(kbps < raw_kbps);
     aether_encoder_destroy(enc);
@@ -149,6 +155,11 @@ static void run_case(int kind, const char *label,
 
     *snr_aud_out = snr_aud;
     *kbps_out    = kbps;
+}
+
+static void run_case(int kind, const char *label,
+                     double *snr_aud_out, double *kbps_out) {
+    run_case_b(kind, 1, label, snr_aud_out, kbps_out);
 }
 
 int main(void) {
@@ -164,6 +175,52 @@ int main(void) {
        fewer bits than dense broadband material. */
     assert(snr_tonal > 20.0);
     assert(snr_broad > 20.0);
+
+    /* --- Batched packets: 4 hops per packet (what the daemons send) -------
+       The per-hop payload blocks are identical to the one-hop case — batching
+       only merges packets — so the decoded signal must be the same (same SNR)
+       while the bitrate drops by the saved header+CRC+frame_samples overhead. */
+    double snr_batch, kbps_batch;
+    run_case_b(1, 4, "broadband x4", &snr_batch, &kbps_batch);
+    assert(fabs(snr_batch - snr_broad) < 0.2);
+    assert(kbps_batch < kbps_broad);
+
+    /* --- SMR is a working rate knob, with a low floor ---------------------
+       Two properties the sender's rate controller depends on:
+
+       (a) Lowering SMR must actually lower the bitrate, monotonically, so an
+           AIMD loop on it converges instead of thrashing.
+       (b) The floor must sit far below the default. Before zero-band coding it
+           did not: every quantised-to-zero coefficient still cost a Rice unary
+           bit, and at 96 kHz the absolute threshold zeroes ~63% of the bins, so
+           HQ-96k could not be pushed below ~500 kbps however coarse it got —
+           which is above what a real RFCOMM link was carrying. The band mask
+           removed that floor.
+
+       Round-tripping at each setting also proves the mask itself survives
+       encode -> decode; a mis-parsed mask desynchronises the whole band walk. */
+    printf("\n");
+    double prev = 1e9, at_max = 0.0, at_min = 0.0;
+    for (float smr = 30.0f; smr >= 6.0f; smr -= 6.0f) {
+        mdct_set_smr_db(smr);
+        assert(fabsf(mdct_get_smr_db() - smr) < 0.01f);
+
+        double snr, kbps;
+        run_case(1, NULL, &snr, &kbps);         /* broadband */
+        printf("  SMR %4.1f dB -> %6.1f kbps  (audible SNR %.1f dB)\n",
+               smr, kbps, snr);
+
+        assert(kbps < prev);                    /* (a) monotone */
+        assert(snr > 0.0);                      /* still decodes sanely */
+        if (smr > 29.0f) at_max = kbps;
+        at_min = kbps;
+        prev = kbps;
+    }
+    /* (b) at least a 2x span between best and worst quality. */
+    assert(at_min * 2.0 < at_max);
+    mdct_set_smr_db(30.0f);
+    printf("\xE2\x9C\x93 HQ rate control: %.0f -> %.0f kbps across SMR 30..6 dB "
+           "(%.1fx span)\n", at_max, at_min, at_max / at_min);
 
     printf("\nHQ round-trip OK (lossy by design; bitrate adapts to content).\n");
     return 0;

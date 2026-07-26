@@ -7,10 +7,12 @@
 
 /* Payload layouts are documented in src/encoder/aether_encoder.c. */
 
+#define AETHER_FLAG_MID_SIDE 0x01
+
 struct AetherDecoder {
     int   last_mode;
     int   mdct_started;
-    float ola[2][MDCT_HOP];   // HQ: overlap-add tail per channel
+    float ola[2][MDCT_HOP];   // HQ: overlap-add tail per channel (L/R domain)
 };
 
 AetherDecoder* aether_decoder_create(void) {
@@ -33,11 +35,13 @@ static int rate_from_code(uint8_t code) {
 
 static const uint8_t* decode_channel_nl(const uint8_t *p, const uint8_t *end,
                                         int n, int32_t *chan_out) {
-    if (end - p < 2) return NULL;
+    if (end - p < 3) return NULL;
     LPCFrameHeader h = {0};
-    h.order = *p++;
-    int k   = *p++;
+    h.order    = *p++;
+    int k      = *p++;
+    int wasted = *p++;
     if (h.order < 0 || h.order > LPC_MAX_ORDER || h.order > n) return NULL;
+    if (wasted < 0 || wasted > 30) return NULL;
 
     long need = (long)h.order * 8 + 2;
     if (end - p < need) return NULL;
@@ -53,22 +57,43 @@ static const uint8_t* decode_channel_nl(const uint8_t *p, const uint8_t *end,
     p += rl;
 
     lpc_decode_frame(&h, res, n, chan_out);
+
+    /* Undo the wasted-bits shift AFTER synthesis: encoder and decoder run the
+       identical integer recursion in the shifted domain, so the final shift is
+       the only place the scale is restored — exact by construction. */
+    if (wasted)
+        for (int i = 0; i < n; i++)
+            chan_out[i] <<= wasted;
+
     return p;
 }
 
 /* ---- Perceptual HQ ------------------------------------------------------ */
 
-/* Emits MDCT_HOP reconstructed samples for one channel (delayed by one frame
-   relative to the encoder's input, which is inherent to overlap-add). */
-static const uint8_t* decode_channel_hq(const uint8_t *p, const uint8_t *end,
-                                        float *ola, float *out) {
-    if (end - p < 3) return NULL;
+/* Parse + dequantise one channel's coefficient block. No transform here: any
+   mid/side reconstruction must happen on coefficients, before the IMDCT, so
+   the overlap-add history stays in L/R space. */
+static const uint8_t* parse_channel_hq(const uint8_t *p, const uint8_t *end,
+                                       float *coeffs) {
+    /* Band mask: bit b set means band b was coded. Unset bands are all-zero and
+       carry neither a scalefactor nor any coefficients (see the encoder). */
+    if (end - p < 8 + 3) return NULL;
+    uint64_t band_mask = 0;
+    for (int i = 0; i < 8; i++) band_mask |= (uint64_t)(*p++) << (8 * i);
+
+    int nsf = 0, nq = 0;
+    for (int b = 0; b < BARK_BANDS; b++) {
+        if (!((band_mask >> b) & 1)) continue;
+        nsf++;
+        nq += mdct_band_start(b + 1) - mdct_band_start(b);
+    }
+
     int sfk = *p++;
     uint16_t sl; memcpy(&sl, p, 2); p += 2;
     if (end - p < sl) return NULL;
 
     int32_t sf_delta[BARK_BANDS];
-    if (rice_decode(p, sl, sfk, BARK_BANDS, sf_delta) < 0) return NULL;
+    if (nsf > 0 && rice_decode(p, sl, sfk, nsf, sf_delta) < 0) return NULL;
     p += sl;
 
     if (end - p < 3) return NULL;
@@ -77,29 +102,67 @@ static const uint8_t* decode_channel_hq(const uint8_t *p, const uint8_t *end,
     if (end - p < cl) return NULL;
 
     int32_t q[MDCT_COEFFS];
-    if (rice_decode(p, cl, cfk, MDCT_COEFFS, q) < 0) return NULL;
+    if (nq > 0 && rice_decode(p, cl, cfk, nq, q) < 0) return NULL;
     p += cl;
 
-    /* Dequantise band by band using the cumulative scalefactors. */
-    float coeffs[MDCT_COEFFS];
-    int sf = 0;
+    /* Dequantise the coded bands using the cumulative scalefactors; the rest
+       stay zero. */
+    memset(coeffs, 0, sizeof(float) * MDCT_COEFFS);
+    int sf = 0, si = 0, qi = 0;
     for (int b = 0; b < BARK_BANDS; b++) {
-        sf += sf_delta[b];
+        if (!((band_mask >> b) & 1)) continue;
+        sf += sf_delta[si++];
         if (sf < 0)   sf = 0;
         if (sf > 255) sf = 255;
         float s = mdct_sf_to_step(sf);
         for (int k = mdct_band_start(b); k < mdct_band_start(b + 1); k++)
-            coeffs[k] = (float)q[k] * s;
+            coeffs[k] = (float)q[qi++] * s;
     }
 
-    float y[MDCT_SIZE];
-    mdct_inverse(coeffs, y);
+    return p;
+}
+
+/* Decode one hop (flags byte + per-channel blocks) and emit MDCT_HOP
+   reconstructed interleaved samples (delayed by one hop relative to the
+   encoder's input, which is inherent to overlap-add). */
+static const uint8_t* decode_hq_hop(AetherDecoder *dec,
+                                    const uint8_t *p, const uint8_t *end,
+                                    int channels, int32_t *pcm_out) {
+    if (end - p < 1) return NULL;
+    uint8_t flags = *p++;
+
+    static float coef[2][MDCT_COEFFS];   /* single-threaded codec */
+    for (int c = 0; c < channels; c++) {
+        p = parse_channel_hq(p, end, coef[c]);
+        if (!p) return NULL;
+    }
+
+    /* Mid/side back to left/right in the coefficient domain: the exact inverse
+       of the encoder's m=(L+R)/2, s=(L-R)/2 is L=m+s, R=m-s. */
+    if (channels == 2 && (flags & AETHER_FLAG_MID_SIDE)) {
+        for (int k = 0; k < MDCT_COEFFS; k++) {
+            float m = coef[0][k], s = coef[1][k];
+            coef[0][k] = m + s;
+            coef[1][k] = m - s;
+        }
+    }
 
     const float *w = mdct_window();
-    for (int n = 0; n < MDCT_HOP; n++)
-        out[n] = ola[n] + y[n] * w[n];
-    for (int n = 0; n < MDCT_HOP; n++)
-        ola[n] = y[MDCT_HOP + n] * w[MDCT_HOP + n];
+    for (int c = 0; c < channels; c++) {
+        float y[MDCT_SIZE], out[MDCT_HOP];
+        mdct_inverse(coef[c], y);
+        for (int n = 0; n < MDCT_HOP; n++)
+            out[n] = dec->ola[c][n] + y[n] * w[n];
+        for (int n = 0; n < MDCT_HOP; n++)
+            dec->ola[c][n] = y[MDCT_HOP + n] * w[MDCT_HOP + n];
+
+        for (int i = 0; i < MDCT_HOP; i++) {
+            float v = out[i];
+            if (v >  8388607.0f) v =  8388607.0f;
+            if (v < -8388608.0f) v = -8388608.0f;
+            pcm_out[i * channels + c] = (int32_t)lrintf(v);
+        }
+    }
 
     return p;
 }
@@ -132,26 +195,38 @@ int aether_decoder_decode(AetherDecoder *dec, const AetherPacket *pkt,
 
     if (mode == AETHER_MODE_NL) {
         if (n > LPC_FRAME_SIZE) return -1;
-        int32_t chan[LPC_FRAME_SIZE];
+        if (end - p < 1) return -1;
+        uint8_t flags = *p++;
+
+        static int32_t chan[2][LPC_FRAME_SIZE];   /* single-threaded codec */
         for (int c = 0; c < channels; c++) {
-            p = decode_channel_nl(p, end, n, chan);
+            p = decode_channel_nl(p, end, n, chan[c]);
             if (!p) return -1;
-            for (int i = 0; i < n; i++)
-                pcm_out[i * channels + c] = chan[i];
         }
-    } else {  /* AETHER_MODE_HQ */
-        if (n != MDCT_HOP) return -1;
-        mdct_init(rate_from_code(pkt->hdr.sample_rate));
-        float out[MDCT_HOP];
-        for (int c = 0; c < channels; c++) {
-            p = decode_channel_hq(p, end, dec->ola[c], out);
-            if (!p) return -1;
+
+        if (channels == 2 && (flags & AETHER_FLAG_MID_SIDE)) {
+            /* m=(l+r)>>1, s=l-r. l+r = 2m + parity, and (l+r) and (l-r) share
+               parity, so the lost low bit is s&1: l = m + ((s + (s&1)) >> 1),
+               r = l - s. Pure integer arithmetic — exact. */
             for (int i = 0; i < n; i++) {
-                float v = out[i];
-                if (v >  8388607.0f) v =  8388607.0f;
-                if (v < -8388608.0f) v = -8388608.0f;
-                pcm_out[i * channels + c] = (int32_t)lrintf(v);
+                int32_t m = chan[0][i], s = chan[1][i];
+                int32_t l = m + ((s + (s & 1)) >> 1);
+                pcm_out[i * channels]     = l;
+                pcm_out[i * channels + 1] = l - s;
             }
+        } else {
+            for (int c = 0; c < channels; c++)
+                for (int i = 0; i < n; i++)
+                    pcm_out[i * channels + c] = chan[c][i];
+        }
+    } else {  /* AETHER_MODE_HQ — one or more hops back to back */
+        if (n % MDCT_HOP != 0 || n > LPC_FRAME_SIZE) return -1;
+        mdct_init(rate_from_code(pkt->hdr.sample_rate));
+        int hops = n / MDCT_HOP;
+        for (int h = 0; h < hops; h++) {
+            p = decode_hq_hop(dec, p, end, channels,
+                              pcm_out + (size_t)h * MDCT_HOP * channels);
+            if (!p) return -1;
         }
     }
 

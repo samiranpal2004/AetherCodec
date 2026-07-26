@@ -55,6 +55,21 @@ typedef struct {
     uint32_t payload_crc32; // CRC-32 of payload bytes
 } AetherPacket;
 
+/* CTRL_STATS_REPLY payload (HLD 8.2): the receiver reports link quality back
+   to the sender every ~500 ms over the same (bidirectional) socket. This is
+   what lets the ABR engine act on what the RECEIVER actually experienced —
+   real sequence-gap loss and buffer state — instead of inferring everything
+   from its own send queue. */
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t  type;         // CTRL_STATS_REPLY
+    uint16_t loss_x10;     // packet loss over the report window, percent * 10
+    uint16_t buffer_ms;    // receiver-side jitter buffer depth
+    uint32_t underruns;    // cumulative playback underrun frames
+    uint32_t recv_total;   // cumulative packets received (sanity/debug)
+} AetherStatsReply;
+#pragma pack(pop)
+
 /* Utility functions */
 uint16_t aether_crc16(const uint8_t *data, size_t len);
 uint32_t aether_crc32(const uint8_t *data, size_t len);
