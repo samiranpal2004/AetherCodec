@@ -1,4 +1,5 @@
 #include "transport_rfcomm.h"
+#include "transport_internal.h"
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/rfcomm.h>
 #include <bluetooth/l2cap.h>
@@ -8,15 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-
-struct RFCOMMTransport {
-    int server_fd;   // listening socket (-1 for client)
-    int conn_fd;     // active connection socket
-    int seqpacket;   // 1 = L2CAP SOCK_SEQPACKET (one packet per SDU), 0 = RFCOMM
-    unsigned long tx_bytes;   // bytes accepted by the socket, for throughput
-    uint8_t tx_buf[AETHER_HEADER_SIZE + AETHER_MAX_PAYLOAD + 4 + 16];
-    uint8_t rx_buf[AETHER_HEADER_SIZE + AETHER_MAX_PAYLOAD + 4 + 16];
-};
 
 RFCOMMTransport* rfcomm_listen(uint8_t channel) {
     RFCOMMTransport *t = calloc(1, sizeof(*t));

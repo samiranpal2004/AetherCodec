@@ -1,11 +1,18 @@
 # AetherCodec — Manual Testing Guide
 
 A short, step-by-step guide to build AetherCodec and manually verify each phase
-that is currently implemented (**Phase 0–6**).
+that is currently implemented (**Phase 0–8**).
 
 > **Legend**
 > - 🖥️ **A** = Laptop A (sender)   🎧 **B** = Laptop B (receiver)
 > - 💻 = runs on a single machine (no second laptop needed)
+
+> **Start here if audio is cracking.** Bluetooth Classic cannot carry hi-res
+> lossless: NL-96k needs **~3.2 Mbps** on real music and a measured RFCOMM link
+> sustained **~200 kbps**. Use the **TCP transport (§11)** — `--tcp` on both
+> daemons — which carries NL-96k bit-perfect with `lost=0`. Sections 3–9 below
+> remain the Bluetooth path and are still worth running to characterise the
+> link, but no codec setting makes Bluetooth close a 15x gap.
 
 ---
 
@@ -811,7 +818,111 @@ into the comparison table in `docs/AetherCodec_IMPLEMENTATION.md` §6.4.
 
 ---
 
-## 11. Quick checklist
+## 11. Phase 8 — TCP transport over Wi-Fi (`--tcp`)
+
+**This is the section to use if audio cracks in every mode.** Bluetooth Classic
+cannot carry hi-res lossless — see the note at the top of this document. TCP
+carries the same AetherPacket stream, byte for byte, over Wi-Fi instead.
+
+`--tcp` is opt-in and mutually exclusive with `--l2cap`; RFCOMM stays the
+default. **Both ends must use it.** Nothing above the transport changes: same
+wire format, same codec, same jitter buffer, and the `CTRL_STATS_REPLY` reverse
+channel works exactly as on Bluetooth.
+
+### 11.1 Single-machine TCP loopback (💻 — no Bluetooth, no second laptop)
+
+The whole path over `127.0.0.1`, which is the fastest way to prove the codec
+runs smooth once the link isn't the bottleneck:
+
+```bash
+# terminal 1 — receiver listens on 0.0.0.0:7331
+./src/aether_receiver --tcp --verbose
+
+# terminal 2 — sender
+./src/aether_sender --tcp --target 127.0.0.1 --mode nl --verbose
+
+# terminal 3 — play a hi-res file into the sink
+sox -n -r 96000 -b 24 -c 2 /tmp/tone.wav synth 30 sine 440 sine 660 vol 0.4
+pw-play --target aether_codec_sink /tmp/tone.wav
+```
+
+**Expect** (measured on the reference machine):
+
+| Mode | Sender | Receiver |
+|---|---|---|
+| `--mode nl` | `link=3250 kbps  queue=21ms  dropped=0` | `lost=0 overflow=0 underruns=0` |
+| `--mode hq` | `smr=54dB` (the controller's **max**), `dropped=0` | `lost=0 underruns=0` |
+| `--mode auto` | `[abr] holding NL-96kHz (loss=0.0%)` from the first poll | `recv == played` |
+
+Three things to read off that:
+
+- **`link=` is the number that matters.** ~3,250 kbps in NL-96k is what
+  near-lossless 24/96 genuinely costs on real content. Bluetooth sustained
+  ~200 kbps — that gap *is* the cracking.
+- **`queue=21ms` (one frame) and `dropped=0`** mean the send queue never backs
+  up. On Bluetooth it pinned at the 500 ms bound and shed frames.
+- **HQ pins at `smr=54dB`** — maximum quality — instead of being driven toward
+  the 12 dB floor. SMR ≈ audible SNR, so this is the transparent end of the
+  range.
+
+> The `[stats] kbps` field is a cumulative average over the operating point, so
+> it starts low and climbs while silence is still in the average. `link=` is
+> instantaneous — trust it.
+
+### 11.2 Two laptops over Wi-Fi (A + B)
+
+Prefer **5 GHz** — 2.4 GHz shares the band with Bluetooth and is exactly the
+coexistence problem being escaped. Both laptops on the same network/subnet.
+
+```bash
+# 🎧 B — note its IP first
+ip -4 addr show | grep inet          # e.g. 192.168.1.42
+./src/aether_receiver --tcp --verbose
+
+# 🖥️ A
+./src/aether_sender --tcp --target 192.168.1.42 --mode nl --verbose
+pw-play --target aether_codec_sink your_music.flac
+```
+
+**Gate:** `lost=0 underruns=0` over 60 s of real music in **NL-96k** — the
+bit-perfect mode, which Bluetooth could never sustain. Then repeat with
+`--mode hq` (expect `smr=` at or near 54) and `--mode auto` (should sit at
+NL-96kHz and never step down on a clean LAN).
+
+Non-default port, if 7331 is taken: `--port 9000` on B, `--target IP:9000` on A.
+
+### 11.3 Throughput comparison
+
+```bash
+# 🎧 B                                # 🖥️ A
+./tools/rfcomm_bench server --tcp     ./tools/rfcomm_bench client <B-IP> --tcp
+```
+
+Compare against the RFCOMM/L2CAP numbers from §3.2. TCP should read multi-Mbps
+where Bluetooth reads hundreds of kbps.
+
+### 11.4 ABR on TCP is loss-driven, not RSSI-driven
+
+There is no HCI RSSI for an IP peer, so `--tcp` doesn't poll it — `[abr]` lines
+print `loss=…%` instead of `RSSI=…`. The ladder is driven by the receiver's
+reported loss plus send-queue backpressure, both of which work fine over TCP.
+`auto` also starts at NL-96k with **no** congestion ceiling (the Bluetooth path
+starts at HQ-96k and earns the NL rungs slowly, which on Wi-Fi would just hold
+quality down for ~20 s per rung for no reason).
+
+### 11.5 Known limits
+
+- **Occasional clicks on a long session are clock drift, not transport.** A and
+  B run independent 96 kHz clocks with no async resampler between them. Fix
+  belongs on the playback side; unrelated to `--tcp`.
+- **TCP retransmits add latency exactly when the network is worst.** A UDP +
+  jitter-buffer variant is the more correct real-time design and is the natural
+  follow-up; TCP came first because it reuses the framing loop verbatim.
+- **No discovery** — the receiver's IP is typed by hand (no mDNS/Wi-Fi Direct).
+
+---
+
+## 12. Quick checklist
 
 - [ ] `make` — clean build, no warnings
 - [ ] `ctest` — 10/10 pass

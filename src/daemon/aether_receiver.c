@@ -8,7 +8,7 @@
    feeds that into the ABR engine, which until this existed had to infer
    everything from its own send queue.
 
-     aether_receiver [--l2cap] [--verbose] */
+     aether_receiver [--l2cap | --tcp [--port N]] [--verbose] */
 #include "aether_decoder.h"
 #include "aether_packet.h"
 #include "transport_rfcomm.h"
@@ -87,10 +87,24 @@ static void send_stats_reply(RFCOMMTransport *t, uint32_t *ctrl_seq,
 }
 
 int main(int argc, char *argv[]) {
-    int verbose = 0, use_l2cap = 0;
+    int verbose = 0, use_l2cap = 0, use_tcp = 0;
+    uint16_t tcp_port = AETHER_TCP_PORT;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--verbose"))    verbose = 1;
         else if (!strcmp(argv[i], "--l2cap")) use_l2cap = 1;
+        else if (!strcmp(argv[i], "--tcp"))   use_tcp = 1;
+        else if (!strcmp(argv[i], "--port") && i + 1 < argc) {
+            long p = strtol(argv[++i], NULL, 10);
+            if (p <= 0 || p > 65535) {
+                fprintf(stderr, "[receiver] bad --port '%s'\n", argv[i]);
+                return 1;
+            }
+            tcp_port = (uint16_t)p;
+        }
+    }
+    if (use_tcp && use_l2cap) {
+        fprintf(stderr, "--tcp and --l2cap are mutually exclusive\n");
+        return 1;
     }
 
     signal(SIGINT, on_sigint);
@@ -112,8 +126,9 @@ int main(int argc, char *argv[]) {
     if (!dec || !jb) { fprintf(stderr, "init failed\n"); return 1; }
 
     printf("[receiver] Playback ready. Waiting for %s connection...\n",
-           use_l2cap ? "L2CAP" : "RFCOMM");
-    RFCOMMTransport *t = use_l2cap ? l2cap_listen(AETHER_L2CAP_PSM)
+           use_tcp ? "TCP" : use_l2cap ? "L2CAP" : "RFCOMM");
+    RFCOMMTransport *t = use_tcp   ? tcp_listen(tcp_port)
+                       : use_l2cap ? l2cap_listen(AETHER_L2CAP_PSM)
                                    : rfcomm_listen(RFCOMM_CHANNEL);
     if (!t) { fprintf(stderr, "[receiver] listen failed\n"); return 1; }
 

@@ -2524,6 +2524,78 @@ so a stalled reverse path can't wedge ABR.
 
 ---
 
+## Phase 8 — TCP Transport (2026-07-26)
+
+> **The honest conclusion from Phase 7.** Every remaining playback problem was
+> link bandwidth, not the codec. Measured on real music, NL-96k needs
+> **~3.2 Mbps** and HQ ~1 Mbps, while the RFCOMM link sustained **~200 kbps**.
+> No amount of codec work closes a 15x gap — Bluetooth Classic physically
+> cannot carry hi-res lossless. So the audio moves to Wi-Fi.
+>
+> This costs almost nothing architecturally because the codec was always
+> transport-agnostic (HLD principle #1, "runs over any byte stream"). TCP is a
+> reliable ordered byte stream exactly like RFCOMM, so it reuses the **identical
+> framing loop and identical wire bytes** — no format change, no version bump.
+
+### 8.1 What was added
+
+`src/transport/transport_tcp.c` with `tcp_listen(port)` / `tcp_connect(host,
+port)`, mirroring the L2CAP pattern: only the constructors are new, and they
+build the same handle with `seqpacket = 0`, so `rfcomm_send_packet` /
+`rfcomm_recv_packet` serve it unchanged. The struct moved to a private
+`transport_internal.h` so both transport sources can build it.
+
+- **`--tcp` on both daemons and `rfcomm_bench`.** Mutually exclusive with
+  `--l2cap`; RFCOMM stays the default. Sender's `--target` becomes an IPv4
+  address, optionally `IP:PORT`; receiver takes `--port N`. Default **7331**.
+- **`TCP_NODELAY` on both ends** — Nagle would batch our already-frame-sized
+  writes behind ACKs and add tens of ms of jitter for no bandwidth gain.
+  **`SO_REUSEADDR`** on the listener so a restart inside TIME_WAIT still binds.
+- **Reverse channel unchanged.** The TCP socket is bidirectional like the
+  RFCOMM one, so `CTRL_STATS_REPLY` uses the same connection handle — no second
+  socket.
+
+### 8.2 ABR on a TCP link
+
+There is no HCI RSSI for an IP peer, so `--tcp` **does not poll RSSI** (polling
+it against an IP address would just fail every 500 ms and print a misleading
+warning). It feeds a strong neutral value and lets the signals that do work
+decide: receiver-reported loss via `CTRL_STATS_REPLY`, plus send-queue
+backpressure. `[abr]` lines print `loss=…%` instead of `RSSI=…` accordingly.
+
+Critically, `--tcp` also **skips `abr_start_at()`**. That call makes the start
+rung a *ceiling* that only relaxes one rung per `ABR_PROBE_INTERVAL_MS` — a
+guard the Bluetooth path needs and Wi-Fi does not. Applying it here would hold
+`auto` at HQ-96k for ~20 s per rung on a link that carries NL-96k comfortably.
+The default state (NL-96k, no ceiling) is correct on TCP, and congestion/loss
+still steps it down if that assumption ever breaks.
+
+### ✅ Phase 8 Checkpoint
+
+- [x] `ctest`: 10/10, clean build, no warnings — transport-only change, codec
+      untouched
+- [x] Single-machine TCP loopback, **NL-96k**: `link=3250 kbps` sustained,
+      `queue=21ms`, `dropped=0`; receiver `recv==played`, `lost=0 overflow=0
+      underruns=0`. This is the ~3.2 Mbps NL genuinely needs, finally carried.
+- [x] Same over **HQ-96k**: rate controller climbs to and **pins at `smr=54dB`**
+      — the controller's maximum quality ceiling — instead of being crushed
+      toward the 12 dB floor as it was on Bluetooth
+- [x] **`--mode auto`** holds **NL-96kHz** (the top rung) from the first poll,
+      driven by `loss=0.0%`; no RSSI warning, no ladder pinning
+- [ ] Two laptops over 5 GHz Wi-Fi (§9.7 in MANUAL_TESTING) — needs second laptop
+
+### 8.3 Known follow-ups (deliberately out of scope here)
+
+- **Clock drift.** A and B each run their own 96 kHz clock with no async
+  resampler between them. Occasional clicks over a long TCP session are drift,
+  not transport — the fix belongs on the playback side.
+- **UDP + jitter buffer.** The more correct design for real-time audio: TCP's
+  retransmits add latency exactly when the network is worst. TCP is the right
+  first move because it reuses the framing loop verbatim.
+- **Discovery.** No mDNS / Wi-Fi Direct; the receiver's IP is typed by hand.
+
+---
+
 ## Quick Reference: Build & Run
 
 ```bash
